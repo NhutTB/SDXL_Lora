@@ -1,0 +1,135 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# configs/train_config.yaml
+# DreamBooth LoRA SDXL Inpainting – example configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+model:
+  pretrained_model_name_or_path: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+  pretrained_vae_model_name_or_path: null   # set to e.g. "madebyollin/sdxl-vae-fp16-fix" for fp16-safe VAE
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  # Root dataset directory.
+  # Expected layout:
+  #   dataset_dir/
+  #     images/        ← RGB images  (e.g. 10_00339.jpg)
+  #     masks/         ← binary masks, SAME filenames (e.g. 10_00339.jpg / .png)
+  #     prompts.json   ← [{"filename": "10_00339.jpg", "prompt": "..."}, ...]
+  dataset_dir: "data/interior"
+
+  # Subfolder names inside dataset_dir (override if your layout differs)
+  images_subdir: "images"
+  masks_subdir:  "masks"
+  json_file:     "prompts.json"
+
+  # Automatic 80 / 10 / 10 split — no manual folder creation needed
+  # Must sum to <= 1.0; test = 1 - train_ratio - val_ratio
+  train_ratio: 0.8
+  val_ratio:   0.1
+
+  center_crop:   false
+  random_flip:   true
+  num_workers:   4
+  repeats:       1
+
+  mask_min_area: 0.1
+  mask_max_area: 0.5
+
+# ── DreamBooth ────────────────────────────────────────────────────────────────
+dreambooth:
+  # Fallback prompt used when an image has no entry in prompts.json
+  instance_prompt: "interior design, high quality"
+
+  # Prior preservation
+  with_prior_preservation: false
+  prior_loss_weight: 1.0
+  class_prompt: "a room"
+  class_data_dir: "data/class_images"
+  num_class_images: 200
+
+  train_text_encoder: false
+
+# ── LoRA ──────────────────────────────────────────────────────────────────────
+lora:
+  rank:     32           # self-attention — quan trọng nhất
+  alpha:    32
+  dropout:  0.1
+  use_dora: false
+
+  # Rank riêng cho từng nhóm (mặc định = rank/2 nếu không set)
+  # Giảm rank ở FF và cross-attn để tránh overfit với dataset nhỏ
+  rank_ff:    16         # feed-forward — học texture/material/lighting
+  rank_xattn: 16         # cross-attention — học text↔image alignment
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  output_dir: "outputs/sdxl-inpaint-lora"
+  resolution: 1024
+
+  train_batch_size: 1
+  sample_batch_size: 1       # used for class image generation
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+
+  num_train_epochs: 10
+  max_train_steps: null      # if set, overrides num_train_epochs
+
+  learning_rate: 1.0e-4
+  text_encoder_lr: 1.0e-5    # only used when train_text_encoder: true
+  lr_scheduler: "cosine"
+  lr_warmup_steps: 100
+  lr_num_cycles: 1
+  lr_power: 1.0
+
+  optimizer: "adamw"         # "adamw" | "prodigy"
+  use_8bit_adam: false
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 1.0e-2
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  seed: 42
+  mixed_precision: "fp16"    # "no" | "fp16" | "bf16"
+
+  enable_xformers: false
+  do_edm_style_training: false
+  snr_gamma: null            # set to e.g. 5.0 to enable Min-SNR weighting
+
+  checkpointing_steps: 500
+  checkpoints_total_limit: 3
+  resume_from_checkpoint: null   # "latest" or explicit path
+
+  output_kohya_format: false
+
+# ── Validation ────────────────────────────────────────────────────────────────
+# Validation uses real images from the val split (10% of dataset).
+# Prompts come from prompts.json — no need to specify them manually.
+validation:
+  validation_steps: 500        # run validation every N global steps
+  num_validation_images: 4     # how many val images to infer & log to WandB
+
+# ── Logging / WandB ───────────────────────────────────────────────────────────
+logging:
+  report_to: "wandb"          # "wandb" | "tensorboard" | "none"
+  run_name: "sdxl-inpaint-lora-run1"
+
+  # WandB settings (only used when report_to == "wandb")
+  wandb_project:  "sdxl-inpaint-dreambooth"
+  wandb_entity:   null         # your WandB username or team; null → default
+  wandb_run_name: null         # null → uses run_name above
+  wandb_tags:
+    - "sdxl"
+    - "inpainting"
+    - "lora"
+    - "interior-design"
+  wandb_notes: ""
+  wandb_api_key: null          # set here OR export WANDB_API_KEY env var
+
+  log_every_n_steps: 10
+
+# # ── Hub upload (optional) ─────────────────────────────────────────────────────
+# push_to_hub:
+#   enabled: false
+#   hub_model_id: "your-username/sdxl-inpaint-interior-lora"
+#   hub_token: null              # or set HF_TOKEN env var

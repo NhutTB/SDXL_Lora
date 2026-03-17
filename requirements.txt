@@ -1,0 +1,14 @@
+torch
+torchvision
+diffusers
+transformers
+accelerate
+peft
+omegaconf
+safetensors
+Pillow
+opencv-python
+numpy
+tqdm
+wandb
+ipython
