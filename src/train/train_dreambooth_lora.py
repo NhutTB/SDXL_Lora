@@ -79,6 +79,13 @@ from diffusers.utils import (
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+# ★ NEW: scipy for mask dilation (fallback to pure-numpy if unavailable)
+try:
+    from scipy.ndimage import binary_dilation as _scipy_binary_dilation
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
+
 if is_wandb_available():
     import wandb
 
@@ -153,13 +160,6 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_prompt_map(json_path: str) -> dict[str, str]:
-    """
-    Load {filename -> prompt} mapping from the JSON file.
-
-    Accepts both:
-      - list of {"filename": "x.jpg", "prompt": "...", ...}
-      - dict of {"x.jpg": "..."}
-    """
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -187,18 +187,8 @@ def make_splits(
     prompt_map: dict[str, str],
     train_ratio: float = 0.8,
     val_ratio: float   = 0.1,
-    # test = 1 - train - val
     seed: int = 42,
 ) -> dict[str, list[Path]]:
-    """
-    Scan images_dir, keep only files that also have a matching mask, then
-    shuffle deterministically and split into train / val / test.
-
-    Returns
-    -------
-    {"train": [...], "val": [...], "test": [...]}
-    Each list contains Path objects pointing into images_dir.
-    """
     images_root = Path(images_dir)
     masks_root  = Path(masks_dir)
     _exts       = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -210,7 +200,6 @@ def make_splits(
     for p in sorted(images_root.iterdir()):
         if p.suffix.lower() not in _exts:
             continue
-        # Must have a corresponding mask
         has_mask = any(
             (masks_root / (p.stem + ext)).exists()
             for ext in [p.suffix, ".png", ".jpg", ".jpeg", ".webp"]
@@ -230,7 +219,6 @@ def make_splits(
     if skipped_prompt:
         logger.warning(f"make_splits: {skipped_prompt} images have no JSON prompt (will use fallback)")
 
-    # Deterministic shuffle
     rng = random.Random(seed)
     shuffled = valid.copy()
     rng.shuffle(shuffled)
@@ -238,7 +226,6 @@ def make_splits(
     n       = len(shuffled)
     n_train = int(n * train_ratio)
     n_val   = int(n * val_ratio)
-    # test gets the remainder so rounding never drops samples
     n_test  = n - n_train - n_val
 
     splits = {
@@ -309,29 +296,462 @@ Training dataset: `{dataset_dir}`
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ★ NEW: Mask dilation helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def dilate_mask_pct(
+    mask_arr: np.ndarray,
+    dilation_pct: float = 0.10,
+    max_area_pct: float = 0.70,
+) -> np.ndarray:
+    """
+    Dilate a binary mask (H×W, dtype uint8, values 0 or 255) by a kernel whose
+    radius is dilation_pct * min(H, W) pixels.  The result is then capped so
+    the dilated region never exceeds max_area_pct of the total image area.
+
+    Parameters
+    ----------
+    mask_arr     : H×W uint8 array (0 = background, 255 = masked)
+    dilation_pct : fraction of min(H,W) used as dilation radius  (default 0.10)
+    max_area_pct : maximum fraction of image that may be masked   (default 0.70)
+
+    Returns
+    -------
+    H×W uint8 array (0 or 255)
+    """
+    h, w  = mask_arr.shape
+    binary = mask_arr > 127
+
+    # Skip if mask is blank
+    if not binary.any():
+        return mask_arr
+
+    # Radius in pixels
+    radius = max(2, int(min(h, w) * dilation_pct))
+
+    if _SCIPY_AVAILABLE:
+        # Circular (elliptical) structuring element
+        y, x   = np.ogrid[-radius: radius + 1, -radius: radius + 1]
+        struct = (x ** 2 + y ** 2) <= radius ** 2
+        dilated = _scipy_binary_dilation(binary, structure=struct)
+    else:
+        # Pure-numpy square dilation (fallback)
+        from numpy.lib.stride_tricks import sliding_window_view
+        pad     = radius
+        padded  = np.pad(binary.astype(np.uint8), pad, mode="constant")
+        windows = sliding_window_view(padded, (2 * radius + 1, 2 * radius + 1))
+        dilated = windows.max(axis=(-2, -1)).astype(bool)
+
+    # ── Cap total masked area at max_area_pct ─────────────────────────────
+    max_pixels = int(h * w * max_area_pct)
+    if dilated.sum() > max_pixels:
+        # Keep the original mask if dilation would push us over the cap.
+        # (We never shrink a mask that was already over the cap.)
+        if binary.sum() <= max_pixels:
+            dilated = binary
+        else:
+            dilated = binary  # already over cap — leave as-is
+
+    return (dilated * 255).astype(np.uint8)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ★ NEW: Auxiliary loss computer
+# ──────────────────────────────────────────────────────────────────────────────
+
+class AuxiliaryLossComputer:
+    """
+    Lazily loads frozen helper models (VGG16, CLIP ViT-B/32, MiDaS) on first
+    use.  Computes pixel, perceptual, CLIP, boundary, depth, and semantic losses
+    in pixel space by first reconstructing the predicted clean image from the
+    UNet output.
+
+    All sub-models are kept frozen (eval mode, no grad through their weights)
+    but gradients DO flow through the decoded predictions back to the LoRA
+    parameters.
+
+    Install optional deps:
+        pip install torchvision transformers torch    (VGG + CLIP)
+        # MiDaS is fetched via torch.hub on first use
+    """
+
+    # VGG ImageNet normalisation constants
+    _VGG_MEAN = [0.485, 0.456, 0.406]
+    _VGG_STD  = [0.229, 0.224, 0.225]
+
+    # CLIP ImageNet normalisation constants
+    _CLIP_MEAN = [0.48145466, 0.4578275,  0.40821073]
+    _CLIP_STD  = [0.26862954, 0.26130258, 0.27577711]
+
+    def __init__(self, device: torch.device, weight_dtype: torch.dtype):
+        self.device       = device
+        self.weight_dtype = weight_dtype
+
+        # Lazy-loaded models (None = not yet loaded, "failed" = load error)
+        self._vgg16           = None
+        self._clip_vision     = None
+        self._depth_model     = None
+        self._depth_transform = None
+
+    # ── Lazy model loaders ────────────────────────────────────────────────
+
+    @property
+    def vgg16(self):
+        """VGG16 feature extractor (up to relu4_3 = layer index 23)."""
+        if self._vgg16 is None:
+            try:
+                from torchvision.models import vgg16, VGG16_Weights
+                net = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:23]
+                net = net.to(self.device).eval()
+                for p in net.parameters():
+                    p.requires_grad_(False)
+                self._vgg16 = net
+                logger.info("AuxLoss: VGG16 perceptual model loaded (relu4_3).")
+            except Exception as e:
+                logger.warning(f"AuxLoss: VGG16 failed to load ({e}). "
+                               "Perceptual + semantic losses disabled.")
+                self._vgg16 = "failed"
+        return self._vgg16
+
+    @property
+    def clip_vision(self):
+        """CLIP ViT-B/32 vision encoder (shared for CLIP + semantic losses)."""
+        if self._clip_vision is None:
+            try:
+                from transformers import CLIPVisionModel
+                m = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
+                m = m.to(self.device).eval()
+                for p in m.parameters():
+                    p.requires_grad_(False)
+                self._clip_vision = m
+                logger.info("AuxLoss: CLIP ViT-B/32 vision model loaded.")
+            except Exception as e:
+                logger.warning(f"AuxLoss: CLIP model failed ({e}). "
+                               "CLIP + semantic losses disabled.")
+                self._clip_vision = "failed"
+        return self._clip_vision
+
+    @property
+    def depth_model(self):
+        """MiDaS small depth estimator (loaded via torch.hub)."""
+        if self._depth_model is None:
+            try:
+                model = torch.hub.load(
+                    "intel-isl/MiDaS", "MiDaS_small", trust_repo=True
+                )
+                xforms = torch.hub.load(
+                    "intel-isl/MiDaS", "transforms", trust_repo=True
+                )
+                model = model.to(self.device).eval()
+                for p in model.parameters():
+                    p.requires_grad_(False)
+                self._depth_model     = model
+                self._depth_transform = xforms.small_transform
+                logger.info("AuxLoss: MiDaS-small depth model loaded.")
+            except Exception as e:
+                logger.warning(f"AuxLoss: MiDaS failed ({e}). Depth loss disabled.")
+                self._depth_model     = "failed"
+                self._depth_transform = None
+        return self._depth_model, self._depth_transform
+
+    # ── Tensor helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _denorm(x: torch.Tensor) -> torch.Tensor:
+        """Diffusion-space [-1, 1]  →  [0, 1]."""
+        return (x * 0.5 + 0.5).clamp(0, 1)
+
+    def _norm_vgg(self, x: torch.Tensor) -> torch.Tensor:
+        """[0, 1] RGB  →  VGG ImageNet normalised."""
+        mean = torch.tensor(self._VGG_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std  = torch.tensor(self._VGG_STD,  device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        return (x - mean) / std
+
+    def _norm_clip(self, x: torch.Tensor) -> torch.Tensor:
+        """[0, 1] RGB  →  CLIP normalised."""
+        mean = torch.tensor(self._CLIP_MEAN, device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        std  = torch.tensor(self._CLIP_STD,  device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+        return (x - mean) / std
+
+    # ── Individual loss functions ─────────────────────────────────────────
+
+    def _pixel_loss(
+        self,
+        pred: torch.Tensor,   # [B, 3, H, W] in [0, 1]
+        gt:   torch.Tensor,
+        mask: torch.Tensor,   # [B, 1, H, W] in {0, 1}
+    ) -> torch.Tensor:
+        """
+        L1 loss restricted to the masked (inpainted) region.
+        Falls back to global L1 if mask is empty.
+        """
+        diff = (pred - gt).abs()
+        denom = mask.sum() * diff.shape[1] + 1e-8
+        if mask.sum() > 0:
+            return (diff * mask).sum() / denom
+        return diff.mean()
+
+    def _perceptual_loss(
+        self,
+        pred: torch.Tensor,
+        gt:   torch.Tensor,
+    ) -> torch.Tensor:
+        """VGG16 relu4_3 feature MSE (full image — context matters for style)."""
+        vgg = self.vgg16
+        if vgg == "failed":
+            return torch.tensor(0.0, device=pred.device)
+        feat_pred = vgg(self._norm_vgg(pred))
+        with torch.no_grad():
+            feat_gt = vgg(self._norm_vgg(gt))
+        return F.mse_loss(feat_pred.float(), feat_gt.float())
+
+    def _clip_loss(
+        self,
+        pred: torch.Tensor,
+        gt:   torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        1 - cosine similarity between CLIP [CLS] embeddings.
+        Penalises semantic drift of the inpainted region.
+        """
+        model = self.clip_vision
+        if model == "failed":
+            return torch.tensor(0.0, device=pred.device)
+        # CLIP expects 224×224 images
+        p = F.interpolate(pred, size=(224, 224), mode="bilinear", align_corners=False)
+        g = F.interpolate(gt,   size=(224, 224), mode="bilinear", align_corners=False)
+        p_feat = model(pixel_values=self._norm_clip(p)).last_hidden_state[:, 0]  # [CLS]
+        with torch.no_grad():
+            g_feat = model(pixel_values=self._norm_clip(g)).last_hidden_state[:, 0]
+        cos = F.cosine_similarity(p_feat.float(), g_feat.float(), dim=-1)
+        return (1.0 - cos).mean()
+
+    def _boundary_loss(
+        self,
+        pred: torch.Tensor,
+        gt:   torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Laplacian edge-coherence loss on the narrow band around the mask
+        boundary.  Encourages seamless blending where the inpainted region
+        meets the preserved content.
+        """
+        # Laplacian kernel applied channel-by-channel
+        lap_k = torch.tensor(
+            [[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]],
+            dtype=pred.dtype, device=pred.device,
+        ).view(1, 1, 3, 3).expand(3, 1, 3, 3)
+
+        # Boundary = dilation(mask) - mask  (thin ring, 5-px wide)
+        boundary = (
+            F.max_pool2d(mask, kernel_size=5, stride=1, padding=2) - mask
+        ).clamp(0, 1)
+
+        edges_pred = F.conv2d(pred, lap_k, padding=1, groups=3)
+        with torch.no_grad():
+            edges_gt = F.conv2d(gt, lap_k, padding=1, groups=3)
+
+        diff  = (edges_pred - edges_gt).abs()
+        denom = boundary.sum() * diff.shape[1] + 1e-8
+        if boundary.sum() > 0:
+            return (diff * boundary).sum() / denom
+        return diff.mean()
+
+    def _depth_loss(
+        self,
+        pred: torch.Tensor,
+        gt:   torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        MiDaS-small depth-consistency loss on the masked region.
+        Ensures the inpainted region matches the depth profile of the scene.
+        """
+        model, _ = self.depth_model
+        if model == "failed" or model is None:
+            return torch.tensor(0.0, device=pred.device)
+
+        # Resize to 256 for speed
+        size = (256, 256)
+        p = F.interpolate(pred, size=size, mode="bilinear", align_corners=False)
+        g = F.interpolate(gt,   size=size, mode="bilinear", align_corners=False)
+        m = F.interpolate(mask, size=size, mode="nearest")
+
+        # MiDaS trained on BGR input
+        with torch.no_grad():
+            d_gt   = model(g.flip(1)).unsqueeze(1)   # [B, 1, H, W]
+        d_pred = model(p.flip(1)).unsqueeze(1)
+
+        if m.sum() > 0:
+            return F.l1_loss(d_pred.float() * m, d_gt.float() * m) / (m.mean() + 1e-8)
+        return F.l1_loss(d_pred.float(), d_gt.float())
+
+    def _semantic_loss(
+        self,
+        pred: torch.Tensor,
+        gt:   torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Patch-level CLIP token MSE — captures high-level semantic structure
+        beyond the [CLS] summary vector used in _clip_loss.
+        Reuses the same (already-loaded) CLIP model.
+        """
+        model = self.clip_vision
+        if model == "failed":
+            return torch.tensor(0.0, device=pred.device)
+        p = F.interpolate(pred, size=(224, 224), mode="bilinear", align_corners=False)
+        g = F.interpolate(gt,   size=(224, 224), mode="bilinear", align_corners=False)
+        p_tokens = model(pixel_values=self._norm_clip(p)).last_hidden_state   # [B, 197, 768]
+        with torch.no_grad():
+            g_tokens = model(pixel_values=self._norm_clip(g)).last_hidden_state
+        return F.mse_loss(p_tokens.float(), g_tokens.float())
+
+    # ── Public interface ──────────────────────────────────────────────────
+
+    def reconstruct_pred_x0(
+        self,
+        model_pred:    torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps:     torch.Tensor,
+        noise_scheduler,
+        do_edm:        bool,
+    ) -> torch.Tensor:
+        """
+        Reconstruct the predicted clean latent x₀ from the UNet output.
+
+        For EDM: model_pred has already been post-conditioned into x₀ space
+                 by the calling code (epsilon → x₀ transform applied there).
+        For DDPM epsilon-prediction: x₀ = (xₜ − √(1−ᾱₜ)·ε) / √ᾱₜ
+        For DDPM v-prediction:       x₀ = √ᾱₜ·xₜ − √(1−ᾱₜ)·v
+        """
+        if do_edm:
+            # Already in x₀ space after EDM post-conditioning
+            return model_pred.float()
+
+        alphas_cp = noise_scheduler.alphas_cumprod.to(
+            device=noisy_latents.device, dtype=torch.float32
+        )
+        a = alphas_cp[timesteps].view(-1, 1, 1, 1)
+        b = (1.0 - a)
+
+        pred_type = noise_scheduler.config.prediction_type
+        if pred_type == "epsilon":
+            pred_x0 = (noisy_latents.float() - b.sqrt() * model_pred.float()) / a.sqrt()
+        elif pred_type == "v_prediction":
+            pred_x0 = a.sqrt() * noisy_latents.float() - b.sqrt() * model_pred.float()
+        else:
+            raise ValueError(f"Unknown prediction_type: {pred_type}")
+
+        return pred_x0.clamp(-5.0, 5.0)   # guard against numerical blow-up
+
+    def compute(
+        self,
+        model_pred:    torch.Tensor,   # UNet output (instance half only)
+        noisy_latents: torch.Tensor,   # x_t            (instance half only)
+        timesteps:     torch.Tensor,   # t              (instance half only)
+        gt_latents:    torch.Tensor,   # clean latents  (instance half only)
+        mask_latent:   torch.Tensor,   # downsampled mask [B, 1, h, w]
+        vae:           AutoencoderKL,
+        weights,                       # OmegaConf loss_weights node
+        do_edm:        bool,
+        noise_scheduler,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """
+        Compute all enabled auxiliary losses and return
+        (total_weighted_aux_loss, {metric_name: scalar}).
+
+        Losses that are disabled (weight == 0) are skipped entirely.
+        VAE decode is only performed when at least one pixel-space loss is active.
+        """
+        total = torch.tensor(0.0, device=model_pred.device)
+        log:  dict[str, float] = {}
+
+        need_decode = any([
+            weights.pixel_weight      > 0,
+            weights.perceptual_weight > 0,
+            weights.clip_weight       > 0,
+            weights.boundary_weight   > 0,
+            weights.depth_weight      > 0,
+            weights.semantic_weight   > 0,
+        ])
+
+        if not need_decode:
+            return total, log
+
+        # ── Reconstruct predicted clean latent ───────────────────────────
+        pred_x0 = self.reconstruct_pred_x0(
+            model_pred, noisy_latents, timesteps, noise_scheduler, do_edm
+        )
+
+        # ── Decode to pixel space ─────────────────────────────────────────
+        # VAE is frozen → no weight updates, but gradients pass through
+        # pred decode (training supervision), not through gt decode.
+        inv_sf = 1.0 / vae.config.scaling_factor
+        pred_px = self._denorm(
+            vae.decode(pred_x0.to(vae.dtype) * inv_sf).sample
+        ).clamp(0, 1).float()
+
+        with torch.no_grad():
+            gt_px = self._denorm(
+                vae.decode(gt_latents.to(vae.dtype) * inv_sf).sample
+            ).clamp(0, 1).float()
+
+        # Upsample latent-space mask → pixel space
+        mask_px = F.interpolate(
+            mask_latent.float(), size=pred_px.shape[-2:], mode="nearest"
+        )
+
+        # ── Pixel L1 ──────────────────────────────────────────────────────
+        if weights.pixel_weight > 0:
+            l = self._pixel_loss(pred_px, gt_px, mask_px)
+            total = total + weights.pixel_weight * l
+            log["train/loss_pixel"] = l.detach().item()
+
+        # ── Perceptual (VGG) ──────────────────────────────────────────────
+        if weights.perceptual_weight > 0:
+            l = self._perceptual_loss(pred_px, gt_px)
+            total = total + weights.perceptual_weight * l
+            log["train/loss_perceptual"] = l.detach().item()
+
+        # ── CLIP semantic similarity ───────────────────────────────────────
+        if weights.clip_weight > 0:
+            l = self._clip_loss(pred_px, gt_px)
+            total = total + weights.clip_weight * l
+            log["train/loss_clip"] = l.detach().item()
+
+        # ── Boundary edge coherence ───────────────────────────────────────
+        if weights.boundary_weight > 0:
+            l = self._boundary_loss(pred_px, gt_px, mask_px)
+            total = total + weights.boundary_weight * l
+            log["train/loss_boundary"] = l.detach().item()
+
+        # ── Depth consistency (MiDaS) ─────────────────────────────────────
+        if weights.depth_weight > 0:
+            l = self._depth_loss(pred_px, gt_px, mask_px)
+            total = total + weights.depth_weight * l
+            log["train/loss_depth"] = l.detach().item()
+
+        # ── Semantic patch features (CLIP tokens) ─────────────────────────
+        if weights.semantic_weight > 0:
+            l = self._semantic_loss(pred_px, gt_px)
+            total = total + weights.semantic_weight * l
+            log["train/loss_semantic"] = l.detach().item()
+
+        return total, log
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # DreamBooth Inpainting Dataset  (JSON-based prompts)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class DreamBoothInpaintingDataset(Dataset):
-    """
-    Dataset for DreamBooth LoRA Inpainting.
-
-    Expected layout:
-        images_dir/          ← RGB images
-        masks_dir/           ← binary masks, SAME filenames as images
-        json_file            ← [{"filename": "x.jpg", "prompt": "..."}, ...]
-
-    Prompt lookup: json_file filename → prompt.
-    Falls back to `fallback_prompt` if a filename is not in the JSON.
-    For prior-preservation: class_data_dir images use class_prompt.
-    """
-
     def __init__(
         self,
         images_dir: str,
         masks_dir: str,
-        prompt_map: dict[str, str],               # pre-loaded {filename -> prompt}
-        file_list: list[Path],                     # pre-computed split (from make_splits)
+        prompt_map: dict[str, str],
+        file_list: list[Path],
         fallback_prompt: str = "",
         class_prompt: str | None = None,
         class_data_dir: str | None = None,
@@ -358,13 +778,11 @@ class DreamBoothInpaintingDataset(Dataset):
         if not file_list:
             raise ValueError("file_list is empty — nothing to load!")
 
-        # Repeat for DreamBooth-style oversampling
         self.instance_paths: list[Path] = list(
             itertools.chain.from_iterable(itertools.repeat(p, repeats) for p in file_list)
         )
         self.masks_root = masks_root
 
-        # ── Image transforms ──────────────────────────────────────────────
         self.train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.LANCZOS)
         self.train_crop   = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
         self.train_flip   = transforms.RandomHorizontalFlip(p=1.0)
@@ -373,14 +791,13 @@ class DreamBoothInpaintingDataset(Dataset):
             transforms.Normalize([0.5], [0.5]),
         ])
 
-        # Pre-process & cache instance images
         self._preprocess_instances()
 
         self.num_instance_images = len(self.instance_paths)
         self._length = self.num_instance_images
 
-        # ── Class images (prior preservation) ────────────────────────────
         self.class_data_root = None
+        _exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
         if class_data_dir is not None:
             self.class_data_root = Path(class_data_dir)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
@@ -396,19 +813,13 @@ class DreamBoothInpaintingDataset(Dataset):
             transforms.Normalize([0.5], [0.5]),
         ])
 
-    # ── Helpers ───────────────────────────────────────────────────────────
-
     @staticmethod
     def _find_mask(masks_root: Path, img_path: Path) -> Path | None:
-        """Return mask path for img_path, or None if not found."""
-        # Try same extension first, then .png, then any image extension
         for ext in [img_path.suffix, ".png", ".jpg", ".jpeg", ".webp"]:
             candidate = masks_root / (img_path.stem + ext)
             if candidate.exists():
                 return candidate
         return None
-
-    # ── Pre-processing ────────────────────────────────────────────────────
 
     def _preprocess_instances(self):
         self.pixel_values: list[torch.Tensor]        = []
@@ -419,11 +830,9 @@ class DreamBoothInpaintingDataset(Dataset):
         self.prompts: list[str]                       = []
 
         for img_path in tqdm(self.instance_paths, desc="Loading dataset", unit="img", dynamic_ncols=True):
-            # ── Prompt ───────────────────────────────────────────────────
             prompt = self.prompt_map.get(img_path.name, self.fallback_prompt)
             self.prompts.append(prompt)
 
-            # ── Image ────────────────────────────────────────────────────
             image = exif_transpose(Image.open(img_path))
             if image.mode != "RGB":
                 image = image.convert("RGB")
@@ -447,22 +856,17 @@ class DreamBoothInpaintingDataset(Dataset):
             pv = self.to_tensor_norm(image)
             self.pixel_values.append(pv)
 
-            # ── Mask ─────────────────────────────────────────────────────
             mask_path = self._find_mask(self.masks_root, img_path)
             mask = self._load_mask(mask_path)
             self.mask_values.append(mask)
-
-            # Masked image = image * (1 - mask)
             self.masked_image_values.append(pv * (1 - mask))
 
     def _load_mask(self, mask_path: Path) -> torch.Tensor:
-        """Load mask from file → [1, H, W] binary float tensor."""
         size = self.size
         m = Image.open(mask_path).convert("L").resize((size, size), Image.NEAREST)
         m_arr = np.array(m, dtype=np.float32) / 255.0
         m_arr = (m_arr > 0.5).astype(np.float32)
         if m_arr.max() == 0:
-            # Blank mask → fall back to random box
             return self._random_box_mask(size)
         return torch.from_numpy(m_arr).unsqueeze(0)
 
@@ -476,8 +880,6 @@ class DreamBoothInpaintingDataset(Dataset):
         mask = np.zeros((size, size), dtype=np.float32)
         mask[y0: y0 + h, x0: x0 + w] = 1.0
         return torch.from_numpy(mask).unsqueeze(0)
-
-    # ── Dataset protocol ──────────────────────────────────────────────────
 
     def __len__(self):
         return self._length
@@ -561,7 +963,7 @@ def generate_class_images(cfg, accelerator):
 
     logger.info(f"Generating {target - cur} class images in {class_images_dir} …")
 
-    has_fp16  = torch.cuda.is_available() or torch.backends.mps.is_available()
+    has_fp16    = torch.cuda.is_available() or torch.backends.mps.is_available()
     torch_dtype = torch.float16 if has_fp16 else torch.float32
 
     pipeline = StableDiffusionXLInpaintPipeline.from_pretrained(
@@ -601,20 +1003,8 @@ def generate_class_images(cfg, accelerator):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def init_wandb(cfg, accelerator):
-    """
-    Explicitly initialise a WandB run on the main process.
-
-    Config keys used (all optional with sensible defaults):
-      cfg.logging.wandb_project    (default: "sdxl-inpaint-dreambooth")
-      cfg.logging.wandb_entity     (default: None  → your default entity)
-      cfg.logging.wandb_run_name   (default: cfg.logging.run_name)
-      cfg.logging.wandb_tags       (default: [])
-      cfg.logging.wandb_notes      (default: "")
-      cfg.logging.wandb_api_key    (default: None  → uses WANDB_API_KEY env var)
-    """
     if not is_wandb_available():
         raise ImportError("wandb is not installed. Run: pip install wandb")
-
     if not accelerator.is_main_process:
         return
 
@@ -635,7 +1025,6 @@ def init_wandb(cfg, accelerator):
 
 
 def log_wandb_images(images: list, prompts: list, step: int, tag: str = "validation"):
-    """Log a list of PIL images to WandB (safe no-op if wandb not active)."""
     if not is_wandb_available() or wandb.run is None:
         return
     wandb.log(
@@ -649,11 +1038,6 @@ def log_wandb_images(images: list, prompts: list, step: int, tag: str = "validat
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _try_import_metrics():
-    """
-    Lazy-import metrics libs. Returns (lpips_fn, ssim_fn, psnr_fn) or None for
-    each that is unavailable. Install with:
-        pip install lpips torchmetrics
-    """
     lpips_fn = ssim_fn = psnr_fn = None
 
     try:
@@ -678,47 +1062,24 @@ def _try_import_metrics():
 
 
 def _pil_to_chw(pil_img: Image.Image, device) -> torch.Tensor:
-    """PIL → float32 tensor [1, 3, H, W] in [-1, 1] for LPIPS, [0, 1] not needed."""
     arr = np.array(pil_img.convert("RGB")).astype(np.float32) / 127.5 - 1.0
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
 
 
 def _pil_to_01(pil_img: Image.Image, device) -> torch.Tensor:
-    """PIL → float32 tensor [1, 3, H, W] in [0, 1] for SSIM / PSNR."""
     arr = np.array(pil_img.convert("RGB")).astype(np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(device)
 
 
-def compute_metrics(
-    pred: Image.Image,
-    gt: Image.Image,
-    mask: Image.Image,
-    device,
-    lpips_fn=None,
-    ssim_fn=None,
-    psnr_fn=None,
-) -> dict:
-    """
-    Compute LPIPS / SSIM / PSNR only on the masked (inpainted) region.
+def compute_metrics(pred, gt, mask, device, lpips_fn=None, ssim_fn=None, psnr_fn=None):
+    results  = {}
+    mask_np  = (np.array(mask.convert("L")) > 127)
+    if not mask_np.any():
+        return results
 
-    pred  : inpainted output
-    gt    : ground-truth (original image)
-    mask  : binary PIL mask (255 = inpainted region)
-    """
-    results = {}
-
-    # Boolean mask for the inpainted region [H, W]
-    mask_np   = (np.array(mask.convert("L")) > 127)
-    has_region = mask_np.any()
-
-    if not has_region:
-        return results  # blank mask — nothing to measure
-
-    # Crop both images to the bounding box of the mask region for efficiency
     ys, xs = np.where(mask_np)
     y1, y2 = ys.min(), ys.max() + 1
     x1, x2 = xs.min(), xs.max() + 1
-
     pred_crop = pred.crop((x1, y1, x2, y2))
     gt_crop   = gt.crop((x1, y1, x2, y2))
 
@@ -726,10 +1087,8 @@ def compute_metrics(
         try:
             lpips_fn = lpips_fn.to(device)
             with torch.no_grad():
-                lp = lpips_fn(
-                    _pil_to_chw(pred_crop, device),
-                    _pil_to_chw(gt_crop,   device),
-                ).item()
+                lp = lpips_fn(_pil_to_chw(pred_crop, device),
+                              _pil_to_chw(gt_crop,   device)).item()
             results["val/lpips"] = lp
         except Exception as e:
             logger.warning(f"LPIPS error: {e}")
@@ -737,11 +1096,8 @@ def compute_metrics(
     if ssim_fn is not None:
         try:
             with torch.no_grad():
-                sv = ssim_fn(
-                    _pil_to_01(pred_crop, device),
-                    _pil_to_01(gt_crop,   device),
-                    data_range=1.0,
-                ).item()
+                sv = ssim_fn(_pil_to_01(pred_crop, device),
+                             _pil_to_01(gt_crop,   device), data_range=1.0).item()
             results["val/ssim"] = sv
         except Exception as e:
             logger.warning(f"SSIM error: {e}")
@@ -749,11 +1105,8 @@ def compute_metrics(
     if psnr_fn is not None:
         try:
             with torch.no_grad():
-                pv = psnr_fn(
-                    _pil_to_01(pred_crop, device),
-                    _pil_to_01(gt_crop,   device),
-                    data_range=1.0,
-                ).item()
+                pv = psnr_fn(_pil_to_01(pred_crop, device),
+                             _pil_to_01(gt_crop,   device), data_range=1.0).item()
             results["val/psnr"] = pv
         except Exception as e:
             logger.warning(f"PSNR error: {e}")
@@ -761,28 +1114,51 @@ def compute_metrics(
     return results
 
 
-def make_comparison_image(original: Image.Image,
-                           mask: Image.Image,
-                           result: Image.Image) -> Image.Image:
+# ★ MODIFIED: 4-panel comparison image
+def make_comparison_image(
+    original:     Image.Image,
+    mask:         Image.Image,
+    result:       Image.Image,
+    mask_dilated: Image.Image | None = None,
+) -> Image.Image:
     """
-    Stitch 3 images side-by-side:
-        [Original] | [Mask (red overlay)] | [Inpainted result]
-    """
-    w, h = original.size
+    Stitch 4 images side-by-side:
 
-    # Overlay mask in red on the original for clarity
+        [Original] | [Mask overlay (red tint)] | [Erased / hole] | [Inpainted result]
+
+    Panel 3 ("Erased / hole") shows the original image with the masked region
+    replaced by mid-gray, making the "hole" visible at a glance.
+
+    If mask_dilated is provided it is used for the overlay and erased panels
+    (so the viewer sees the actual region passed to the pipeline).
+    """
+    w, h     = original.size
     orig_arr = np.array(original.convert("RGB"))
-    mask_arr = np.array(mask.convert("L"))
-    overlay  = orig_arr.copy()
-    overlay[mask_arr > 127] = [255, 80, 80]   # red tint on masked region
+
+    # Use dilated mask for display if available, else original mask
+    display_mask = mask_dilated if mask_dilated is not None else mask
+    mask_arr     = np.array(display_mask.convert("L"))
+
+    # ── Panel 2: red overlay ──────────────────────────────────────────────
+    overlay = orig_arr.copy()
+    overlay[mask_arr > 127] = [255, 80, 80]
     overlay_img = Image.fromarray(
         (orig_arr * 0.5 + overlay * 0.5).astype(np.uint8)
     )
 
-    combined = Image.new("RGB", (w * 3, h))
+    # ── Panel 3: erased hole ──────────────────────────────────────────────
+    # Masked pixels → neutral gray (128, 128, 128) so the "missing" region
+    # is clearly visible without colour bias.
+    erased     = orig_arr.copy()
+    erased[mask_arr > 127] = [180, 180, 180]
+    erased_img = Image.fromarray(erased)
+
+    # ── Stitch ────────────────────────────────────────────────────────────
+    combined = Image.new("RGB", (w * 4, h))
     combined.paste(original,    (0,     0))
     combined.paste(overlay_img, (w,     0))
-    combined.paste(result,      (w * 2, 0))
+    combined.paste(erased_img,  (w * 2, 0))
+    combined.paste(result,      (w * 3, 0))
     return combined
 
 
@@ -790,19 +1166,24 @@ def make_comparison_image(original: Image.Image,
 # Validation
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Module-level cache so metrics libs are only imported once
 _METRICS_CACHE: tuple | None = None
 
 
-def log_validation(pipeline, cfg, accelerator, epoch, step, weight_dtype,
-                   val_paths: list[Path] | None = None,
-                   val_masks_root: Path | None  = None,
-                   val_prompt_map: dict[str, str] | None = None):
+# ★ MODIFIED: mask dilation + 4-panel comparison
+def log_validation(
+    pipeline, cfg, accelerator, epoch, step, weight_dtype,
+    val_paths:      list[Path] | None        = None,
+    val_masks_root: Path | None              = None,
+    val_prompt_map: dict[str, str] | None    = None,
+):
     if not val_paths:
         logger.info("No val split — skipping validation.")
         return []
 
-    logger.info(f"Running validation (epoch {epoch}, step {step}, {len(val_paths)} val images) …")
+    logger.info(
+        f"Running validation (epoch {epoch}, step {step}, "
+        f"{len(val_paths)} val images) …"
+    )
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
@@ -820,46 +1201,71 @@ def log_validation(pipeline, cfg, accelerator, epoch, step, weight_dtype,
         if torch.cuda.is_available() else nullcontext()
     )
 
-    # Load metrics libs once
     global _METRICS_CACHE
     if _METRICS_CACHE is None:
         _METRICS_CACHE = _try_import_metrics()
     lpips_fn, ssim_fn, psnr_fn = _METRICS_CACHE
 
-    # Run on ALL val images for metrics, but only log num_validation_images to WandB
-    num_to_show    = min(cfg.validation.num_validation_images, len(val_paths))
-    all_metrics: list[dict] = []
-    wandb_images:  list     = []
-    wandb_prompts: list     = []
+    # ── Mask dilation config ──────────────────────────────────────────────
+    # dilation_pct : 10 % of min(H,W) radius expansion
+    # max_area_pct : hard cap — dilated mask never exceeds 70 % of image
+    mask_dilation_pct = float(getattr(cfg.validation, "mask_dilation_pct", 0.10))
+    mask_max_area_pct = float(getattr(cfg.validation, "mask_max_area_pct", 0.70))
+
+    num_to_show   = min(cfg.validation.num_validation_images, len(val_paths))
+    all_metrics:  list[dict] = []
+    wandb_images: list       = []
+    wandb_prompts: list      = []
 
     for idx, img_path in enumerate(tqdm(val_paths, desc="Validation", leave=False)):
-        # ── Load original image ───────────────────────────────────────────
+        # ── Load original ─────────────────────────────────────────────────
         pil_orig = Image.open(img_path).convert("RGB").resize((res, res), Image.LANCZOS)
 
         # ── Load mask ─────────────────────────────────────────────────────
-        pil_mask = None
+        pil_mask_raw = None
         if val_masks_root is not None:
             for ext in [img_path.suffix, ".png", ".jpg", ".jpeg"]:
                 mp = val_masks_root / (img_path.stem + ext)
                 if mp.exists():
-                    marr = np.array(Image.open(mp).convert("L").resize((res, res), Image.NEAREST))
+                    marr = np.array(
+                        Image.open(mp).convert("L").resize((res, res), Image.NEAREST)
+                    )
                     if marr.max() > 0:
-                        pil_mask = Image.fromarray(marr)
+                        pil_mask_raw = Image.fromarray(marr)
                     break
-        if pil_mask is None:
+
+        if pil_mask_raw is None:
             marr = np.zeros((res, res), dtype=np.uint8)
             marr[res // 4: 3 * res // 4, res // 4: 3 * res // 4] = 255
-            pil_mask = Image.fromarray(marr)
+            pil_mask_raw = Image.fromarray(marr)
+
+        # ★ NEW: Dilate mask by 10%, cap at 70% of image area ─────────────
+        raw_arr    = np.array(pil_mask_raw.convert("L"))
+        dilated_arr = dilate_mask_pct(
+            raw_arr,
+            dilation_pct=mask_dilation_pct,
+            max_area_pct=mask_max_area_pct,
+        )
+        pil_mask_dilated = Image.fromarray(dilated_arr)
+
+        # Log dilation stats on first image of first run
+        if idx == 0:
+            orig_pct  = raw_arr.astype(bool).mean() * 100
+            dil_pct   = dilated_arr.astype(bool).mean() * 100
+            logger.info(
+                f"  Mask dilation: {orig_pct:.1f}% → {dil_pct:.1f}%  "
+                f"(cap={mask_max_area_pct*100:.0f}%)"
+            )
 
         # ── Prompt ────────────────────────────────────────────────────────
         prompt = (val_prompt_map or {}).get(img_path.name, "interior design, high quality")
 
-        # ── Inpaint ───────────────────────────────────────────────────────
+        # ── Inpaint with DILATED mask ─────────────────────────────────────
         with autocast_ctx:
             out = pipeline(
                 prompt=prompt,
                 image=pil_orig,
-                mask_image=pil_mask,
+                mask_image=pil_mask_dilated,   # ★ use dilated mask
                 height=res, width=res,
                 num_inference_steps=25,
                 generator=generator,
@@ -867,40 +1273,52 @@ def log_validation(pipeline, cfg, accelerator, epoch, step, weight_dtype,
 
         out.save(val_dir / f"epoch{epoch:04d}_step{step:07d}_{img_path.stem}.png")
 
-        # ── Metrics (on all val images) ───────────────────────────────────
+        # ── Metrics (raw mask for fair comparison) ────────────────────────
         m = compute_metrics(
-            pred=out, gt=pil_orig, mask=pil_mask,
+            pred=out, gt=pil_orig, mask=pil_mask_raw,
             device=accelerator.device,
             lpips_fn=lpips_fn, ssim_fn=ssim_fn, psnr_fn=psnr_fn,
         )
         all_metrics.append(m)
 
-        # ── Collect for WandB image log (first N only) ────────────────────
+        # ── Collect for WandB (first N images only) ───────────────────────
         if idx < num_to_show:
-            comparison = make_comparison_image(pil_orig, pil_mask, out)
-            comparison.save(val_dir / f"epoch{epoch:04d}_step{step:07d}_{img_path.stem}_cmp.png")
+            # ★ 4-panel comparison: original | overlay | erased | inpainted
+            comparison = make_comparison_image(
+                original=pil_orig,
+                mask=pil_mask_raw,
+                result=out,
+                mask_dilated=pil_mask_dilated,  # show dilated mask in panels 2+3
+            )
+            comparison.save(
+                val_dir / f"epoch{epoch:04d}_step{step:07d}_{img_path.stem}_cmp.png"
+            )
             wandb_images.append(comparison)
-            wandb_prompts.append(f"[orig | mask overlay | inpaint]  {prompt}")
+            wandb_prompts.append(
+                f"[orig | mask(+dil) | erased hole | inpaint]  {prompt}"
+            )
 
-    # ── Aggregate metrics across all val images ───────────────────────────
+    # ── Aggregate metrics ─────────────────────────────────────────────────
     agg = {}
     for key in ["val/lpips", "val/ssim", "val/psnr"]:
         vals = [m[key] for m in all_metrics if key in m]
         if vals:
-            agg[key]              = float(np.mean(vals))
-            agg[key + "_std"]     = float(np.std(vals))
-            agg[key + "_best"]    = float(np.min(vals) if "lpips" in key else np.max(vals))
+            agg[key]           = float(np.mean(vals))
+            agg[key + "_std"]  = float(np.std(vals))
+            agg[key + "_best"] = float(np.min(vals) if "lpips" in key else np.max(vals))
 
     if agg:
         logger.info(
-            f"  val metrics → "
-            + "  ".join(f"{k}={v:.4f}" for k, v in agg.items() if "_std" not in k and "_best" not in k)
+            "  val metrics → "
+            + "  ".join(
+                f"{k}={v:.4f}"
+                for k, v in agg.items()
+                if "_std" not in k and "_best" not in k
+            )
         )
 
-    # ── Log to WandB ──────────────────────────────────────────────────────
     if accelerator.is_main_process and is_wandb_available() and wandb.run is not None:
         log_dict = {**agg, "val/epoch": epoch}
-        # Comparison images
         log_dict["validation"] = [
             wandb.Image(img, caption=p)
             for img, p in zip(wandb_images, wandb_prompts)
@@ -998,8 +1416,6 @@ def main(cfg):
         logging_dir=os.path.join(cfg.training.output_dir, "logs"),
     )
     kwargs      = DistributedDataParallelKwargs(find_unused_parameters=True)
-    # Use "wandb" as tracker only if report_to == "wandb"; accelerate will init
-    # its own wandb wrapper, but we also call init_wandb() for full control.
     report_to   = cfg.logging.report_to if cfg.logging.report_to != "none" else None
     accelerator = Accelerator(
         gradient_accumulation_steps=cfg.training.gradient_accumulation_steps,
@@ -1017,12 +1433,10 @@ def main(cfg):
 
     set_seed(cfg.training.seed)
 
-    # ── WandB explicit init ───────────────────────────────────────────────
     use_wandb = cfg.logging.report_to == "wandb"
     if use_wandb and accelerator.is_main_process:
         init_wandb(cfg, accelerator)
 
-    # ── Generate class images if prior preservation enabled ───────────────
     if cfg.dreambooth.with_prior_preservation:
         if accelerator.is_main_process:
             generate_class_images(cfg, accelerator)
@@ -1062,7 +1476,6 @@ def main(cfg):
     text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
 
-    # ── Weight dtype ──────────────────────────────────────────────────────
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -1074,7 +1487,6 @@ def main(cfg):
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
-    # ── xFormers ─────────────────────────────────────────────────────────
     if getattr(cfg.training, "enable_xformers", False):
         if is_xformers_available():
             unet.enable_xformers_memory_efficient_attention()
@@ -1082,38 +1494,31 @@ def main(cfg):
         else:
             logger.warning("xFormers requested but not available.")
 
-    # ── Gradient checkpointing ────────────────────────────────────────────
     if cfg.training.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
-    # ── LoRA / DoRA on UNet ───────────────────────────────────────────────
+    # ── LoRA / DoRA ───────────────────────────────────────────────────────
     rank     = cfg.lora.rank
     alpha    = getattr(cfg.lora, "alpha", rank)
     dropout  = getattr(cfg.lora, "dropout", 0.0)
     use_dora = getattr(cfg.lora, "use_dora", False)
 
-    # Rank riêng cho từng nhóm layer — tránh overfit với dataset nhỏ
-    rank_attn = rank                                          # self-attention (quan trọng nhất)
-    rank_ff   = getattr(cfg.lora, "rank_ff",   rank // 2)   # feed-forward   (học texture/style)
-    rank_xattn= getattr(cfg.lora, "rank_xattn",rank // 2)   # cross-attention (text↔image)
+    rank_attn  = rank
+    rank_ff    = getattr(cfg.lora, "rank_ff",    rank // 2)
+    rank_xattn = getattr(cfg.lora, "rank_xattn", rank // 2)
 
-    # ── Nhóm 1: Self-attention projection (rank đầy đủ) ──────────────────
-    # Học "vật thể nào liên quan đến vật thể nào trong ảnh"
     unet_lora_attn = get_lora_config(
         rank=rank_attn, alpha=rank_attn, dropout=dropout, use_dora=use_dora,
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
     unet.add_adapter(unet_lora_attn)
 
-    # ── Nhóm 2: Cross-attention (rank/2) ─────────────────────────────────
-    # Học "prompt ảnh hưởng vào ảnh như thế nào" — text↔image
-    # add_k_proj / add_v_proj là key/value từ text encoder sang UNet
-    _cross_modules = ["add_k_proj", "add_q_proj", "add_v_proj", "add_out_proj"]
+    _cross_modules   = ["add_k_proj", "add_q_proj", "add_v_proj", "add_out_proj"]
     _cross_available = []
-    for name, module in unet.named_modules():
-        for target in _cross_modules:
-            if target in name and target not in _cross_available:
-                _cross_available.append(target)
+    for name, _ in unet.named_modules():
+        for t in _cross_modules:
+            if t in name and t not in _cross_available:
+                _cross_available.append(t)
 
     if _cross_available:
         unet_lora_xattn = get_lora_config(
@@ -1125,18 +1530,8 @@ def main(cfg):
     else:
         logger.warning("Cross-attention modules not found — skipping cross-attn LoRA.")
 
-    # ── Nhóm 3: Feed-forward (rank/2) ────────────────────────────────────
-    # Học texture, material, lighting style của interior design
-    _ff_modules = []
-    for name, _ in unet.named_modules():
-        if "ff.net" in name:
-            if "0.proj" in name and "ff_net_0_proj" not in _ff_modules:
-                _ff_modules.append("proj")   # linear inside ff block
-                break
-
     unet_lora_ff = get_lora_config(
         rank=rank_ff, alpha=rank_ff, dropout=dropout + 0.05, use_dora=use_dora,
-        # dropout cao hơn 1 chút cho FF vì dễ overfit nhất
         target_modules=["ff.net.0.proj", "ff.net.2"],
     )
     try:
@@ -1145,15 +1540,13 @@ def main(cfg):
     except Exception as e:
         logger.warning(f"FF LoRA skipped ({e}) — continuing with attn-only LoRA.")
 
-    # Log tổng số trainable params
     trainable = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in unet.parameters())
+    total_p   = sum(p.numel() for p in unet.parameters())
     logger.info(
-        f"UNet LoRA params: {trainable:,} trainable / {total:,} total "
-        f"({100 * trainable / total:.3f}%)"
+        f"UNet LoRA params: {trainable:,} trainable / {total_p:,} total "
+        f"({100 * trainable / total_p:.3f}%)"
     )
 
-    # ── LoRA on text encoders (optional) ─────────────────────────────────
     train_te = cfg.dreambooth.train_text_encoder
     if train_te:
         te_lora_cfg = get_lora_config(
@@ -1172,7 +1565,6 @@ def main(cfg):
             models_to_cast += [text_encoder_one, text_encoder_two]
         cast_training_params(models_to_cast, dtype=torch.float32)
 
-    # ── Save / Load hooks ─────────────────────────────────────────────────
     accelerator.register_save_state_pre_hook(
         build_save_hook(accelerator, unet, text_encoder_one, text_encoder_two, cfg)
     )
@@ -1180,9 +1572,61 @@ def main(cfg):
         build_load_hook(accelerator, unet, text_encoder_one, text_encoder_two, cfg)
     )
 
+    # ── ★ NEW: Auxiliary loss setup ───────────────────────────────────────
+    loss_weights = getattr(cfg, "loss_weights", None)
+
+    # Build a simple namespace with all weights defaulting to 0 when missing
+    class _LW:
+        diffusion_weight  = 1.0
+        pixel_weight      = 0.0
+        perceptual_weight = 0.0
+        clip_weight       = 0.0
+        boundary_weight   = 0.0
+        depth_weight      = 0.0
+        semantic_weight   = 0.0
+        aux_loss_every_n_steps = 1
+
+    lw = _LW()
+    if loss_weights is not None:
+        for attr in vars(lw):
+            val = getattr(loss_weights, attr, None)
+            if val is not None:
+                setattr(lw, attr, float(val) if attr != "aux_loss_every_n_steps" else int(val))
+
+    # Warn if weights don't sum close to 1
+    total_w = (
+        lw.diffusion_weight + lw.pixel_weight + lw.perceptual_weight +
+        lw.clip_weight + lw.boundary_weight + lw.depth_weight + lw.semantic_weight
+    )
+    if abs(total_w - 1.0) > 0.01:
+        logger.warning(
+            f"loss_weights sum to {total_w:.4f} (expected ~1.0). "
+            "Consider re-normalising in your YAML."
+        )
+
+    has_aux = any([
+        lw.pixel_weight > 0, lw.perceptual_weight > 0, lw.clip_weight > 0,
+        lw.boundary_weight > 0, lw.depth_weight > 0, lw.semantic_weight > 0,
+    ])
+    aux_computer = (
+        AuxiliaryLossComputer(accelerator.device, weight_dtype) if has_aux else None
+    )
+    if has_aux:
+        logger.info(
+            f"Auxiliary losses enabled  "
+            f"(diffusion={lw.diffusion_weight:.2f} "
+            f"pixel={lw.pixel_weight:.2f} "
+            f"perceptual={lw.perceptual_weight:.2f} "
+            f"clip={lw.clip_weight:.2f} "
+            f"boundary={lw.boundary_weight:.2f} "
+            f"depth={lw.depth_weight:.2f} "
+            f"semantic={lw.semantic_weight:.2f}  "
+            f"every={lw.aux_loss_every_n_steps} steps)"
+        )
+
     # ── Optimiser ─────────────────────────────────────────────────────────
-    unet_params         = list(filter(lambda p: p.requires_grad, unet.parameters()))
-    params_to_optimize  = [{"params": unet_params, "lr": cfg.training.learning_rate}]
+    unet_params        = list(filter(lambda p: p.requires_grad, unet.parameters()))
+    params_to_optimize = [{"params": unet_params, "lr": cfg.training.learning_rate}]
 
     if train_te:
         te_lr = getattr(cfg.training, "text_encoder_lr", cfg.training.learning_rate)
@@ -1227,11 +1671,11 @@ def main(cfg):
             eps=cfg.training.adam_epsilon,
         )
 
-    # ── Load prompt map & build splits (80 / 10 / 10) ────────────────────
-    dataset_dir  = Path(cfg.data.dataset_dir)
-    images_dir   = str(dataset_dir / getattr(cfg.data, "images_subdir", "images"))
-    masks_dir    = str(dataset_dir / getattr(cfg.data, "masks_subdir",  "masks"))
-    json_file    = str(dataset_dir / getattr(cfg.data, "json_file",     "prompts.json"))
+    # ── Data ──────────────────────────────────────────────────────────────
+    dataset_dir = Path(cfg.data.dataset_dir)
+    images_dir  = str(dataset_dir / getattr(cfg.data, "images_subdir", "images"))
+    masks_dir   = str(dataset_dir / getattr(cfg.data, "masks_subdir",  "masks"))
+    json_file   = str(dataset_dir / getattr(cfg.data, "json_file",     "prompts.json"))
 
     prompt_map = load_prompt_map(json_file)
     logger.info(f"Loaded {len(prompt_map)} prompt entries from {json_file}")
@@ -1242,11 +1686,9 @@ def main(cfg):
         prompt_map=prompt_map,
         train_ratio=getattr(cfg.data, "train_ratio", 0.8),
         val_ratio=getattr(cfg.data,   "val_ratio",   0.1),
-        # test = remainder
         seed=cfg.training.seed,
     )
 
-    # ── Dataset & DataLoader ──────────────────────────────────────────────
     train_dataset = DreamBoothInpaintingDataset(
         images_dir=images_dir,
         masks_dir=masks_dir,
@@ -1264,15 +1706,13 @@ def main(cfg):
         mask_max_area=getattr(cfg.data, "mask_max_area", 0.5),
     )
 
-    # Val / test splits kept as plain path lists — used only for inference
     val_paths  = splits["val"]
     test_paths = splits["test"]
     masks_root = Path(masks_dir)
 
     logger.info(
         f"  train={len(splits['train'])}  "
-        f"val={len(val_paths)}  "
-        f"test={len(test_paths)}"
+        f"val={len(val_paths)}  test={len(test_paths)}"
     )
 
     train_loader = DataLoader(
@@ -1304,7 +1744,6 @@ def main(cfg):
         power=getattr(cfg.training, "lr_power", 1.0),
     )
 
-    # ── Prepare with Accelerator ──────────────────────────────────────────
     if train_te:
         unet, text_encoder_one, text_encoder_two, optimizer, train_loader, lr_scheduler = (
             accelerator.prepare(
@@ -1320,7 +1759,6 @@ def main(cfg):
     if not cfg.training.max_train_steps:
         max_train_steps = num_train_epochs * num_update_steps_per_epoch
 
-    # ── Pre-compute text embeddings (frozen text encoder) ────────────────
     def compute_time_ids(original_size, crops_coords_top_left):
         target_size = (cfg.training.resolution, cfg.training.resolution)
         ids = list(original_size + crops_coords_top_left + target_size)
@@ -1335,10 +1773,8 @@ def main(cfg):
                 emb, pooled = encode_prompt(text_encoders, tokenizers, prompt)
             return emb.to(accelerator.device), pooled.to(accelerator.device)
 
-        # All prompts are per-image from JSON, so always encode per-batch
         has_custom_prompts = True
 
-    # ── Trackers (Accelerate's built-in tracker wrapper) ──────────────────
     if accelerator.is_main_process and report_to:
         accelerator.init_trackers(
             cfg.logging.run_name,
@@ -1347,26 +1783,18 @@ def main(cfg):
 
     logger.info("***** Starting DreamBooth LoRA Inpainting training *****")
     logger.info(f"  Dataset dir   = {dataset_dir}")
-    logger.info(f"  Images        = {images_dir}")
-    logger.info(f"  Masks         = {masks_dir}")
-    logger.info(f"  JSON prompts  = {json_file}")
     logger.info(f"  Instances     = {len(train_dataset)}  (train split × repeats)")
-    logger.info(f"  Val images    = {len(val_paths)}")
-    logger.info(f"  Test images   = {len(test_paths)}")
     logger.info(f"  Epochs        = {num_train_epochs}")
     logger.info(f"  Batch size    = {cfg.training.train_batch_size}")
     logger.info(f"  Grad. accum   = {cfg.training.gradient_accumulation_steps}")
     logger.info(f"  Total steps   = {max_train_steps}")
     logger.info(f"  LoRA rank     = {rank}  |  alpha = {alpha}  |  DoRA = {use_dora}")
-    logger.info(f"  Prior preserv = {cfg.dreambooth.with_prior_preservation}")
-    logger.info(f"  Train TE      = {train_te}")
     logger.info(f"  EDM-style     = {do_edm}")
 
     global_step = 0
     first_epoch = 0
     resume_step = 0
 
-    # ── Resume ────────────────────────────────────────────────────────────
     if getattr(cfg.training, "resume_from_checkpoint", None):
         ckpt = cfg.training.resume_from_checkpoint
         if ckpt == "latest":
@@ -1390,7 +1818,6 @@ def main(cfg):
             resume_step = global_step - first_epoch * num_update_steps_per_epoch
             logger.info(f"Resumed from {ckpt}  (global_step={global_step})")
 
-    # ── EDM sigma helper ──────────────────────────────────────────────────
     def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
         sigmas      = noise_scheduler.sigmas.to(device=accelerator.device, dtype=dtype)
         schedule_ts = noise_scheduler.timesteps.to(accelerator.device)
@@ -1417,7 +1844,10 @@ def main(cfg):
             accelerator.unwrap_model(text_encoder_one).text_model.embeddings.requires_grad_(True)
             accelerator.unwrap_model(text_encoder_two).text_model.embeddings.requires_grad_(True)
 
-        batches_to_skip = resume_step * cfg.training.gradient_accumulation_steps if epoch == first_epoch else 0
+        batches_to_skip = (
+            resume_step * cfg.training.gradient_accumulation_steps
+            if epoch == first_epoch else 0
+        )
         if batches_to_skip > 0:
             logger.info(f"  Epoch {epoch}: skipping {batches_to_skip} batches …")
             if hasattr(accelerator, "skip_first_batches"):
@@ -1476,7 +1906,7 @@ def main(cfg):
                     for s, c in zip(batch["original_sizes"], batch["crop_top_lefts"])
                 ])
 
-                # ── Text embeddings (per-batch, from JSON prompts) ────────
+                # ── Text embeddings ───────────────────────────────────────
                 if not train_te:
                     cur_embeds, cur_pooled = compute_text_embeddings(batch["prompts"])
                 else:
@@ -1484,8 +1914,7 @@ def main(cfg):
                     tokens_two = tokenize_prompt(tokenizer_two, batch["prompts"])
                     cur_embeds, cur_pooled = encode_prompt(
                         text_encoders=[text_encoder_one, text_encoder_two],
-                        tokenizers=None,
-                        prompt=None,
+                        tokenizers=None, prompt=None,
                         text_input_ids_list=[tokens_one, tokens_two],
                     )
 
@@ -1493,9 +1922,7 @@ def main(cfg):
                 unet_input = torch.cat([inp_noisy_latents, mask, masked_latents], dim=1)
 
                 model_pred = unet(
-                    unet_input,
-                    timesteps,
-                    cur_embeds,
+                    unet_input, timesteps, cur_embeds,
                     added_cond_kwargs={"time_ids": add_time_ids, "text_embeds": cur_pooled},
                     return_dict=False,
                 )[0]
@@ -1506,9 +1933,9 @@ def main(cfg):
                     if noise_scheduler.config.prediction_type == "epsilon":
                         model_pred = model_pred * (-sigmas) + noisy_latents
                     elif noise_scheduler.config.prediction_type == "v_prediction":
-                        model_pred = model_pred * (-sigmas / (sigmas ** 2 + 1) ** 0.5) + (
-                            noisy_latents / (sigmas ** 2 + 1)
-                        )
+                        model_pred = model_pred * (
+                            -sigmas / (sigmas ** 2 + 1) ** 0.5
+                        ) + (noisy_latents / (sigmas ** 2 + 1))
                     weighting = (sigmas ** -2.0).float()
 
                 # ── Target ────────────────────────────────────────────────
@@ -1520,12 +1947,14 @@ def main(cfg):
                         else noise_scheduler.get_velocity(latents, noise, timesteps)
                     )
                 else:
-                    raise ValueError(f"Unknown prediction_type: {noise_scheduler.config.prediction_type}")
+                    raise ValueError(
+                        f"Unknown prediction_type: {noise_scheduler.config.prediction_type}"
+                    )
 
                 # ── Prior preservation split ──────────────────────────────
                 if cfg.dreambooth.with_prior_preservation:
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                    target,     target_prior     = torch.chunk(target, 2, dim=0)
+                    target,     target_prior     = torch.chunk(target,     2, dim=0)
 
                     if weighting is not None:
                         prior_loss = torch.mean(
@@ -1533,28 +1962,69 @@ def main(cfg):
                             .reshape(target_prior.shape[0], -1), 1
                         ).mean()
                     else:
-                        prior_loss = F.mse_loss(model_pred_prior.float(), target_prior.float(), reduction="mean")
+                        prior_loss = F.mse_loss(
+                            model_pred_prior.float(), target_prior.float(), reduction="mean"
+                        )
 
-                # ── Instance loss ─────────────────────────────────────────
+                # ── Diffusion MSE loss ────────────────────────────────────
                 if snr_gamma is None:
                     if weighting is not None:
-                        loss = torch.mean(
+                        diffusion_loss = torch.mean(
                             (weighting.float() * (model_pred.float() - target.float()) ** 2)
                             .reshape(target.shape[0], -1), 1
                         ).mean()
                     else:
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        diffusion_loss = F.mse_loss(
+                            model_pred.float(), target.float(), reduction="mean"
+                        )
                 else:
                     snr         = compute_snr(noise_scheduler, timesteps)
                     base_weight = (
-                        torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                        torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1)
+                        .min(dim=1)[0] / snr
                     )
                     mse_loss_weights = (
-                        base_weight + 1 if noise_scheduler.config.prediction_type == "v_prediction"
+                        base_weight + 1
+                        if noise_scheduler.config.prediction_type == "v_prediction"
                         else base_weight
                     )
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = (loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights).mean()
+                    diffusion_loss = F.mse_loss(
+                        model_pred.float(), target.float(), reduction="none"
+                    )
+                    diffusion_loss = (
+                        diffusion_loss.mean(dim=list(range(1, len(diffusion_loss.shape))))
+                        * mse_loss_weights
+                    ).mean()
+
+                # ── ★ NEW: Auxiliary pixel-space losses ───────────────────
+                aux_loss  = torch.tensor(0.0, device=latents.device)
+                aux_log: dict[str, float] = {}
+
+                if (
+                    aux_computer is not None
+                    and (global_step % lw.aux_loss_every_n_steps == 0)
+                ):
+                    # Instance half only (for prior-preservation the batch is split)
+                    _n_inst      = model_pred.shape[0]
+                    _noisy_inst  = noisy_latents[:_n_inst]
+                    _ts_inst     = timesteps[:_n_inst]
+                    _latents_inst = latents[:_n_inst]
+                    _mask_inst   = mask[:_n_inst]
+
+                    aux_loss, aux_log = aux_computer.compute(
+                        model_pred    = model_pred,
+                        noisy_latents = _noisy_inst,
+                        timesteps     = _ts_inst,
+                        gt_latents    = _latents_inst,
+                        mask_latent   = _mask_inst,
+                        vae           = vae,
+                        weights       = lw,
+                        do_edm        = do_edm,
+                        noise_scheduler = noise_scheduler,
+                    )
+
+                # ── Combine all losses ────────────────────────────────────
+                loss = lw.diffusion_weight * diffusion_loss + aux_loss
 
                 if cfg.dreambooth.with_prior_preservation:
                     loss = loss + cfg.dreambooth.prior_loss_weight * prior_loss
@@ -1582,31 +2052,34 @@ def main(cfg):
 
                 if accelerator.is_main_process:
                     loss_val = loss.detach().item()
+                    diff_val = diffusion_loss.detach().item()
                     lr_val   = lr_scheduler.get_last_lr()[0]
 
                     if global_step % cfg.logging.log_every_n_steps == 0:
-                        # Accelerate tracker (covers wandb / tensorboard)
-                        accelerator.log(
-                            {"train/loss": loss_val, "train/lr": lr_val},
-                            step=global_step,
-                        )
-                        # Direct wandb log (more granular metrics)
-                        if use_wandb and wandb.run is not None:
-                            wandb.log({
-                                "train/loss":  loss_val,
-                                "train/lr":    lr_val,
-                                "train/epoch": epoch,
-                                "train/step":  global_step,
-                            }, step=global_step)
+                        log_dict = {
+                            "train/loss":           loss_val,
+                            "train/loss_diffusion": diff_val,
+                            "train/lr":             lr_val,
+                        }
+                        # ★ Add individual aux loss components
+                        log_dict.update(aux_log)
 
-                    # ── Checkpoint ────────────────────────────────────────
+                        accelerator.log(log_dict, step=global_step)
+
+                        if use_wandb and wandb.run is not None:
+                            wandb.log(
+                                {**log_dict, "train/epoch": epoch, "train/step": global_step},
+                                step=global_step,
+                            )
+
                     if global_step % cfg.training.checkpointing_steps == 0:
-                        ckpt_dir = os.path.join(cfg.training.output_dir, f"checkpoint-{global_step}")
+                        ckpt_dir = os.path.join(
+                            cfg.training.output_dir, f"checkpoint-{global_step}"
+                        )
                         accelerator.save_state(ckpt_dir)
                         with open(os.path.join(ckpt_dir, "training_state.json"), "w") as fh:
                             json.dump({"global_step": global_step, "epoch": epoch}, fh)
 
-                        # Prune old checkpoints
                         ckpts = sorted(
                             [d for d in Path(cfg.training.output_dir).iterdir()
                              if d.name.startswith("checkpoint-")],
@@ -1617,7 +2090,6 @@ def main(cfg):
                             shutil.rmtree(old)
                         logger.info(f"Saved checkpoint: {ckpt_dir}")
 
-                    # ── Validation ────────────────────────────────────────
                     if global_step % cfg.validation.validation_steps == 0:
                         pipeline = StableDiffusionXLInpaintPipeline.from_pretrained(
                             pretrained,
@@ -1638,7 +2110,11 @@ def main(cfg):
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
 
-            progress_bar.set_postfix(loss=loss.detach().item(), lr=lr_scheduler.get_last_lr()[0])
+            progress_bar.set_postfix(
+                loss=loss.detach().item(),
+                diff=diffusion_loss.detach().item(),
+                lr=lr_scheduler.get_last_lr()[0],
+            )
             if global_step >= max_train_steps:
                 break
 
@@ -1662,15 +2138,13 @@ def main(cfg):
             text_encoder_2_lora_layers=te2_lora_layers,
         )
 
-        # Kohya export
         if getattr(cfg.training, "output_kohya_format", False):
-            lora_sd = load_file(f"{cfg.training.output_dir}/pytorch_lora_weights.safetensors")
+            lora_sd  = load_file(f"{cfg.training.output_dir}/pytorch_lora_weights.safetensors")
             peft_sd  = convert_all_state_dict_to_peft(lora_sd)
             kohya_sd = convert_state_dict_to_kohya(peft_sd)
             save_file(kohya_sd, f"{cfg.training.output_dir}/pytorch_lora_weights_kohya.safetensors")
             logger.info("Saved Kohya-format LoRA weights.")
 
-        # Final validation
         vae_final = AutoencoderKL.from_pretrained(
             vae_path,
             subfolder="vae" if not getattr(cfg.model, "pretrained_vae_model_name_or_path", None) else None,
@@ -1695,10 +2169,8 @@ def main(cfg):
             lora_enabled=True,
             use_dora=use_dora,
             instance_prompt=getattr(cfg.dreambooth, "instance_prompt", None),
-            validation_prompt=None,
         )
 
-        # Push to Hub
         if getattr(cfg, "push_to_hub", None) and cfg.push_to_hub.enabled:
             from huggingface_hub import HfApi
             api = HfApi(token=cfg.push_to_hub.hub_token)
@@ -1710,7 +2182,6 @@ def main(cfg):
                 ignore_patterns=["step_*", "epoch_*", "checkpoint-*"],
             )
 
-        # ── Close WandB run ───────────────────────────────────────────────
         if use_wandb and wandb.run is not None:
             wandb.finish()
             logger.info("WandB run finished.")
@@ -1718,10 +2189,6 @@ def main(cfg):
     accelerator.end_training()
     logger.info("Training complete.")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DreamBooth LoRA for SDXL Inpainting")

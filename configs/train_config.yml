@@ -5,25 +5,15 @@
 
 model:
   pretrained_model_name_or_path: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
-  pretrained_vae_model_name_or_path: null   # set to e.g. "madebyollin/sdxl-vae-fp16-fix" for fp16-safe VAE
+  pretrained_vae_model_name_or_path: null   # e.g. "madebyollin/sdxl-vae-fp16-fix"
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
-  # Root dataset directory.
-  # Expected layout:
-  #   dataset_dir/
-  #     images/        ← RGB images  (e.g. 10_00339.jpg)
-  #     masks/         ← binary masks, SAME filenames (e.g. 10_00339.jpg / .png)
-  #     prompts.json   ← [{"filename": "10_00339.jpg", "prompt": "..."}, ...]
   dataset_dir: "data/interior"
-
-  # Subfolder names inside dataset_dir (override if your layout differs)
   images_subdir: "images"
   masks_subdir:  "masks"
   json_file:     "prompts.json"
 
-  # Automatic 80 / 10 / 10 split — no manual folder creation needed
-  # Must sum to <= 1.0; test = 1 - train_ratio - val_ratio
   train_ratio: 0.8
   val_ratio:   0.1
 
@@ -37,10 +27,8 @@ data:
 
 # ── DreamBooth ────────────────────────────────────────────────────────────────
 dreambooth:
-  # Fallback prompt used when an image has no entry in prompts.json
   instance_prompt: "interior design, high quality"
 
-  # Prior preservation
   with_prior_preservation: false
   prior_loss_weight: 1.0
   class_prompt: "a room"
@@ -51,15 +39,48 @@ dreambooth:
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 lora:
-  rank:     32           # self-attention — quan trọng nhất
+  rank:     32
   alpha:    32
   dropout:  0.1
   use_dora: false
+  rank_ff:    16
+  rank_xattn: 16
 
-  # Rank riêng cho từng nhóm (mặc định = rank/2 nếu không set)
-  # Giảm rank ở FF và cross-attn để tránh overfit với dataset nhỏ
-  rank_ff:    16         # feed-forward — học texture/material/lighting
-  rank_xattn: 16         # cross-attention — học text↔image alignment
+# ── Loss weights  (must sum to 1.0 = 100%) ───────────────────────────────────
+#
+#  Budget breakdown:
+#  ┌──────────────────┬───────┬───────────────────────────────────────────────┐
+#  │ Loss             │  Pct  │ Purpose                                       │
+#  ├──────────────────┼───────┼───────────────────────────────────────────────┤
+#  │ diffusion (MSE)  │  50%  │ Core denoising — always the primary signal    │
+#  │ pixel (L1)       │  15%  │ Pixel fidelity on the masked region           │
+#  │ perceptual (VGG) │  15%  │ Texture/material quality (VGG relu4_3)        │
+#  │ clip             │   8%  │ Text-image semantic alignment ([CLS] token)   │
+#  │ boundary (edge)  │   5%  │ Seamless blending at mask boundary            │
+#  │ depth (MiDaS)    │   4%  │ 3-D spatial consistency of the scene          │
+#  │ semantic (CLIP)  │   3%  │ High-level patch-token feature consistency    │
+#  └──────────────────┴───────┴───────────────────────────────────────────────┘
+#  Total = 1.00
+#
+#  Tips for tuning:
+#  • Set a weight to 0.0 to disable that loss entirely (saves compute).
+#  • For datasets > 500 images you can safely raise perceptual_weight to 0.20
+#    and lower pixel_weight to 0.10.
+#  • depth and semantic require torch.hub download on first run; set to 0.0 if
+#    offline or if VRAM is tight (< 16 GB).
+#  • aux_loss_every_n_steps: 1 computes aux losses every step (accurate but
+#    slow if perceptual/depth/semantic are enabled).  Set to 4 or 8 to compute
+#    auxiliary losses only every N gradient steps for ~2-3× speed-up.
+#
+loss_weights:
+  diffusion_weight:  0.50   # 50%
+  pixel_weight:      0.15   # 15%
+  perceptual_weight: 0.15   # 15%
+  clip_weight:       0.08   #  8%
+  boundary_weight:   0.05   #  5%
+  depth_weight:      0.04   #  4%
+  semantic_weight:   0.03   #  3%
+  aux_loss_every_n_steps: 1  # compute aux losses every N steps (1 = every step)
 
 # ── Training ──────────────────────────────────────────────────────────────────
 training:
@@ -67,21 +88,21 @@ training:
   resolution: 1024
 
   train_batch_size: 1
-  sample_batch_size: 1       # used for class image generation
+  sample_batch_size: 1
   gradient_accumulation_steps: 4
   gradient_checkpointing: true
 
   num_train_epochs: 10
-  max_train_steps: null      # if set, overrides num_train_epochs
+  max_train_steps: null
 
   learning_rate: 1.0e-4
-  text_encoder_lr: 1.0e-5    # only used when train_text_encoder: true
+  text_encoder_lr: 1.0e-5
   lr_scheduler: "cosine"
   lr_warmup_steps: 100
   lr_num_cycles: 1
   lr_power: 1.0
 
-  optimizer: "adamw"         # "adamw" | "prodigy"
+  optimizer: "adamw"
   use_8bit_adam: false
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -90,41 +111,49 @@ training:
   max_grad_norm: 1.0
 
   seed: 42
-  mixed_precision: "fp16"    # "no" | "fp16" | "bf16"
+  mixed_precision: "fp16"
 
   enable_xformers: false
   do_edm_style_training: false
-  snr_gamma: null            # set to e.g. 5.0 to enable Min-SNR weighting
+  snr_gamma: null
 
   checkpointing_steps: 500
   checkpoints_total_limit: 3
-  resume_from_checkpoint: null   # "latest" or explicit path
+  resume_from_checkpoint: null
 
   output_kohya_format: false
 
 # ── Validation ────────────────────────────────────────────────────────────────
-# Validation uses real images from the val split (10% of dataset).
-# Prompts come from prompts.json — no need to specify them manually.
 validation:
-  validation_steps: 500        # run validation every N global steps
-  num_validation_images: 4     # how many val images to infer & log to WandB
+  validation_steps: 500
+  num_validation_images: 4
+
+  # ★ NEW: Mask dilation settings
+  # The mask used for inference is dilated by (mask_dilation_pct * min(H,W))
+  # pixels so the inpainting pipeline has a small "safety margin" around the
+  # true masked region.  The dilated mask is capped at mask_max_area_pct of
+  # the total image area to prevent excessive context erasure.
+  mask_dilation_pct: 0.10   # expand mask radius by 10% of min(H,W)
+  mask_max_area_pct: 0.70   # dilated mask never exceeds 70% of image area
+
+  # Comparison images in WandB now show 4 panels:
+  #   [Original] | [Mask overlay (dilated, red tint)] | [Erased hole] | [Inpainted]
 
 # ── Logging / WandB ───────────────────────────────────────────────────────────
 logging:
-  report_to: "wandb"          # "wandb" | "tensorboard" | "none"
+  report_to: "wandb"
   run_name: "sdxl-inpaint-lora-run1"
 
-  # WandB settings (only used when report_to == "wandb")
   wandb_project:  "sdxl-inpaint-dreambooth"
-  wandb_entity:   null         # your WandB username or team; null → default
-  wandb_run_name: null         # null → uses run_name above
+  wandb_entity:   null
+  wandb_run_name: null
   wandb_tags:
     - "sdxl"
     - "inpainting"
     - "lora"
     - "interior-design"
   wandb_notes: ""
-  wandb_api_key: null          # set here OR export WANDB_API_KEY env var
+  wandb_api_key: null
 
   log_every_n_steps: 10
 
@@ -132,4 +161,4 @@ logging:
 # push_to_hub:
 #   enabled: false
 #   hub_model_id: "your-username/sdxl-inpaint-interior-lora"
-#   hub_token: null              # or set HF_TOKEN env var
+#   hub_token: null
