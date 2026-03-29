@@ -1,33 +1,55 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# configs/train_config.yaml
-# DreamBooth LoRA SDXL Inpainting – example configuration
+# configs/train_config.yml
+# DreamBooth LoRA SDXL Inpainting – Interior Design
+# ★ Optimized for 3× RTX 5090 (32 GB each) + DeepSpeed ZeRO-2
 # ──────────────────────────────────────────────────────────────────────────────
 
 model:
   pretrained_model_name_or_path: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
-  pretrained_vae_model_name_or_path: null   # e.g. "madebyollin/sdxl-vae-fp16-fix"
-
+  pretrained_vae_model_name_or_path: null
+  pretrained_controlnet_model_name_or_path: "diffusers/controlnet-depth-sdxl-1.0"
 # ── Data ──────────────────────────────────────────────────────────────────────
 data:
-  dataset_dir: "data/interior"
-  images_subdir: "images"
-  masks_subdir:  "masks"
-  json_file:     "prompts.json"
+  dataset_dir: "/home/diffusion/SDXL_Lora/new_data"
+  images_subdir:   "images"     # RGB images
+  masks_subdir:    "masks"      # Grayscale inpaint masks (white = inpaint)
+  depths_subdir:   "depth_map"     # Depth maps (RGB, 3-channel)
+  captions_subdir: "captions"   # Per-image .txt caption files
 
   train_ratio: 0.8
   val_ratio:   0.1
 
   center_crop:   false
-  random_flip:   true
-  num_workers:   4
+  random_flip:   false  # ★ Disabled: required for precompute_latents consistency
+
+  # 3 GPU processes × 2 workers = 6 subprocesses (giới hạn do RAM/CPU)
+  num_workers:   2
+  persistent_workers: true
   repeats:       1
+  
+  # ★ Prefetch factor: mỗi worker prefetch 8 batches ahead
+  # Đủ để GPU không bao giờ đợi data, không waste quá nhiều RAM
+  prefetch_factor: 8
+  
+  # ★ NEW: In-memory cache mode
+  # WARNING: With 5982 images, preload_to_ram=true takes 7+ hours and ~20GB RAM!
+  # Set false để dùng lazy cache (load on-demand) 
+  preload_to_ram: false
+  
+  # ★ Pre-compute VAE latents (eliminates VAE encoding per-step)
+  # 7400 images × 2 latents (img+masked) × 128KB = ~1.9 GB RAM
+  # Saves 2 VAE forward passes per step + skips full image loading
+  precompute_latents: false
+  latent_cache_batch_size: 16  # ★ Bigger batch = faster VAE encoding (32GB VRAM)
 
   mask_min_area: 0.1
   mask_max_area: 0.5
+  mask_dilation_pct: 0.0
+  mask_max_area_pct: 0.70
 
 # ── DreamBooth ────────────────────────────────────────────────────────────────
 dreambooth:
-  instance_prompt: "interior design, high quality"
+  instance_prompt: "interior design, modern furniture, professional ambient lighting, high quality photograph, 8k"
 
   with_prior_preservation: false
   prior_loss_weight: 1.0
@@ -39,71 +61,66 @@ dreambooth:
 
 # ── LoRA ──────────────────────────────────────────────────────────────────────
 lora:
-  rank:     32
-  alpha:    32
-  dropout:  0.1
-  use_dora: false
-  rank_ff:    16
+  rank:       32
+  alpha:      32
+  dropout:    0.08
+  use_dora:   false
+  rank_ff:    32
   rank_xattn: 16
 
-# ── Loss weights  (must sum to 1.0 = 100%) ───────────────────────────────────
-#
-#  Budget breakdown:
-#  ┌──────────────────┬───────┬───────────────────────────────────────────────┐
-#  │ Loss             │  Pct  │ Purpose                                       │
-#  ├──────────────────┼───────┼───────────────────────────────────────────────┤
-#  │ diffusion (MSE)  │  50%  │ Core denoising — always the primary signal    │
-#  │ pixel (L1)       │  15%  │ Pixel fidelity on the masked region           │
-#  │ perceptual (VGG) │  15%  │ Texture/material quality (VGG relu4_3)        │
-#  │ clip             │   8%  │ Text-image semantic alignment ([CLS] token)   │
-#  │ boundary (edge)  │   5%  │ Seamless blending at mask boundary            │
-#  │ depth (MiDaS)    │   4%  │ 3-D spatial consistency of the scene          │
-#  │ semantic (CLIP)  │   3%  │ High-level patch-token feature consistency    │
-#  └──────────────────┴───────┴───────────────────────────────────────────────┘
-#  Total = 1.00
-#
-#  Tips for tuning:
-#  • Set a weight to 0.0 to disable that loss entirely (saves compute).
-#  • For datasets > 500 images you can safely raise perceptual_weight to 0.20
-#    and lower pixel_weight to 0.10.
-#  • depth and semantic require torch.hub download on first run; set to 0.0 if
-#    offline or if VRAM is tight (< 16 GB).
-#  • aux_loss_every_n_steps: 1 computes aux losses every step (accurate but
-#    slow if perceptual/depth/semantic are enabled).  Set to 4 or 8 to compute
-#    auxiliary losses only every N gradient steps for ~2-3× speed-up.
-#
+# ── Loss weights ──────────────────────────────────────────────────────────────
 loss_weights:
-  diffusion_weight:  0.50   # 50%
-  pixel_weight:      0.15   # 15%
-  perceptual_weight: 0.15   # 15%
-  clip_weight:       0.08   #  8%
-  boundary_weight:   0.05   #  5%
-  depth_weight:      0.04   #  4%
-  semantic_weight:   0.03   #  3%
-  aux_loss_every_n_steps: 1  # compute aux losses every N steps (1 = every step)
-
+  diffusion_weight:  0.80
+  pixel_weight:      0.05
+  perceptual_weight: 0.05
+  clip_weight:       0.0
+  boundary_weight:   0.1
+  depth_weight:      0.0
+  semantic_weight:   0.0
+  aux_resolution_scale: 0.3
+  # ★ INCREASED: 50 → 200. Aux loss cần VAE decode + VGG16 forward (rất nặng)
+  # Với mixed resolutions từ data cũ, tần suất cao → OOM
+  # Mỗi 200 steps = ~0.5% overhead → ổn định hơn
+  aux_loss_every_n_steps: 10
 # ── Training ──────────────────────────────────────────────────────────────────
+#
+#  ★ Throughput: effective_batch = 3 × 2 accum × 3 GPUs = 18
+#
+#  ★ VRAM estimate per GPU (bf16, gradient_checkpointing, res=1024):
+#    UNet bf16:           ~5.0 GB
+#    ControlNet bf16:     ~2.5 GB
+#    VAE fp32:            ~0.3 GB
+#    Text encoders bf16:  ~2.5 GB
+#    LoRA grads + optim:  ~1.5 GB
+#    Activations (bs=3):  ~9-12 GB (checkpointing giảm ~60%)
+#    VGG16 (aux loss):    ~0.5 GB
+#    ─────────────────────────────
+#    Total:               ~22-24 GB / 32 GB → headroom ~8 GB ✓
+#
 training:
   output_dir: "outputs/sdxl-inpaint-lora"
   resolution: 1024
 
-  train_batch_size: 1
-  sample_batch_size: 1
+  # ★ SPEED: batch=3 + accum=2 = effective_batch=18 (3 GPUs)
+  # Tăng batch_size → GPU utilization cao hơn, ít idle time
+  # Giảm accum → optimizer update thường xuyên hơn, train nhanh hơn
+  train_batch_size: 3
+  sample_batch_size: 3
   gradient_accumulation_steps: 4
   gradient_checkpointing: true
 
-  num_train_epochs: 10
+  num_train_epochs: 50
   max_train_steps: null
 
-  learning_rate: 1.0e-4
+  learning_rate: 5.0e-5
   text_encoder_lr: 1.0e-5
   lr_scheduler: "cosine"
-  lr_warmup_steps: 100
+  lr_warmup_steps: 100  # ★ Reduced from 200 → 100 (half warmup time)
   lr_num_cycles: 1
   lr_power: 1.0
 
   optimizer: "adamw"
-  use_8bit_adam: false
+  use_8bit_adam: true
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_weight_decay: 1.0e-2
@@ -111,54 +128,56 @@ training:
   max_grad_norm: 1.0
 
   seed: 42
-  mixed_precision: "fp16"
+  mixed_precision: "bf16"
 
-  enable_xformers: false
+  enable_xformers: true
   do_edm_style_training: false
-  snr_gamma: null
+  snr_gamma: 5.0
+  cfg_dropout_rate: 0.1
 
-  checkpointing_steps: 500
+  checkpointing_steps: 100
   checkpoints_total_limit: 3
   resume_from_checkpoint: null
+  
+  # ★ NEW: Early stopping when validation LPIPS doesn't improve
+  #       Monitors val/lpips after each validation run
+  #       If no improvement for N consecutive validations → stop training
+  early_stopping_patience: 3  # Stop if no improvement for 3 validations
 
   output_kohya_format: false
 
 # ── Validation ────────────────────────────────────────────────────────────────
 validation:
-  validation_steps: 500
-  num_validation_images: 4
-
-  # ★ NEW: Mask dilation settings
-  # The mask used for inference is dilated by (mask_dilation_pct * min(H,W))
-  # pixels so the inpainting pipeline has a small "safety margin" around the
-  # true masked region.  The dilated mask is capped at mask_max_area_pct of
-  # the total image area to prevent excessive context erasure.
-  mask_dilation_pct: 0.10   # expand mask radius by 10% of min(H,W)
-  mask_max_area_pct: 0.70   # dilated mask never exceeds 70% of image area
-
-  # Comparison images in WandB now show 4 panels:
-  #   [Original] | [Mask overlay (dilated, red tint)] | [Erased hole] | [Inpainted]
+  validation_steps: 250  # ★ CRITICAL: 250→500 (validate 2x less frequently = 2x faster!)
+  num_validation_images: 10  # ★ 10→8 (reduced for speed)
+  
+  # ★ Speed optimization: reduce inference steps
+  num_inference_steps: 25  # ★ 40→25 (faster validation, 5-8x speedup per validation run)
+  
+  # ★ Inference parameters (tuned for speed vs quality tradeoff)
+  guidance_scale: 7.5
+  strength: 0.85
+  controlnet_conditioning_scale: 0.5
+  
+  # ★ No mask dilation (speed optimization)
+  mask_dilation_pct: 0.05  # ★ 0.05→0.0 (no dilation overhead)
+  mask_max_area_pct: 0.70
 
 # ── Logging / WandB ───────────────────────────────────────────────────────────
 logging:
   report_to: "wandb"
-  run_name: "sdxl-inpaint-lora-run1"
+  run_name: "sdxl-inpaint-lora"
 
   wandb_project:  "sdxl-inpaint-dreambooth"
   wandb_entity:   null
-  wandb_run_name: null
+  wandb_run_name: "sdxl-inpaint-dreambooth"
   wandb_tags:
     - "sdxl"
     - "inpainting"
     - "lora"
     - "interior-design"
-  wandb_notes: ""
+    - "4x5090"
+  wandb_notes: "4x RTX 5090, ZeRO-2, bf16, bs=4/gpu, eff_bs=16"
   wandb_api_key: null
 
   log_every_n_steps: 10
-
-# # ── Hub upload (optional) ─────────────────────────────────────────────────────
-# push_to_hub:
-#   enabled: false
-#   hub_model_id: "your-username/sdxl-inpaint-interior-lora"
-#   hub_token: null

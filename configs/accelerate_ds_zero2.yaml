@@ -1,0 +1,37 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# accelerate_ds_zero2.yaml
+# Optimized for 4× RTX 5090 (32 GB each) – LoRA fine-tuning
+#
+# ★ ZeRO-2 thay vì ZeRO-3:
+#   - LoRA chỉ ~30M trainable params → không cần partition parameters
+#   - ZeRO-2 partition optimizer states + gradients (đủ tiết kiệm VRAM)
+#   - Giảm communication overhead ~30-40% so với ZeRO-3
+#   - Không cần gather params mỗi forward/backward pass
+# ──────────────────────────────────────────────────────────────────────────────
+
+compute_environment: LOCAL_MACHINE
+debug: false
+
+deepspeed_config:
+  deepspeed_config_file: configs/ds_zero2.json
+  zero3_init_flag: false          # ZeRO-2 → không cần ZeRO-3 init
+
+distributed_type: DEEPSPEED
+
+machine_rank: 0
+main_training_function: main
+
+num_machines: 1
+num_processes: 3                  # ★ 4 GPUs
+
+rdzv_backend: static
+same_network: true
+
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+
+# ★ NOTE: mixed_precision, gradient_accumulation_steps, gradient_clipping, etc.
+# are configured in ds_zero2.json (deepspeed_config_file), NOT here.
+# When using deepspeed_config_file, these must be removed from this accelerate config.

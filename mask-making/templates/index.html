@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>G-Mask Pro | Premium Mask Editor</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=Outfit:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <header>
+            <div class="logo">
+                <i class="fas fa-mask"></i>
+                <span>G-Mask <span>Pro</span></span>
+            </div>
+            <div class="header-actions">
+                <label for="imageUpload" class="btn btn-primary">
+                    <i class="fas fa-upload"></i> Upload Image
+                </label>
+                <input type="file" id="imageUpload" accept="image/*" hidden>
+                <button id="downloadBtn" class="btn btn-success" disabled>
+                    <i class="fas fa-download"></i> Download Mask
+                </button>
+            </div>
+        </header>
+
+        <main>
+            <aside class="toolbar">
+                <div class="tool-group">
+                    <label>Drawing Tools</label>
+                    <div class="tool-grid">
+                        <button class="tool-btn active" data-tool="brush" title="Brush">
+                            <i class="fas fa-paint-brush"></i>
+                        </button>
+                        <button class="tool-btn" data-tool="rectangle" title="Rectangle">
+                            <i class="fas fa-square"></i>
+                        </button>
+                        <button class="tool-btn" data-tool="circle" title="Circle">
+                            <i class="fas fa-circle"></i>
+                        </button>
+                        <button class="tool-btn" data-tool="eraser" title="Eraser">
+                            <i class="fas fa-eraser"></i>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="tool-group">
+                    <label>Brush Settings</label>
+                    <div class="setting-item">
+                        <span>Size: <span id="sizeValue">20</span>px</span>
+                        <input type="range" id="brushSize" min="1" max="100" value="20">
+                    </div>
+                    <div class="setting-item">
+                        <span>Gray: <span id="grayValue">255</span></span>
+                        <input type="range" id="grayLevel" min="0" max="255" value="255">
+                        <div class="gray-preview" id="grayPreview"></div>
+                    </div>
+                </div>
+
+                <div class="tool-group">
+                    <label>Actions</label>
+                    <button id="clearBtn" class="btn btn-outline-danger w-100">
+                        <i class="fas fa-trash"></i> Clear All
+                    </button>
+                    <button id="undoBtn" class="btn btn-outline-warning w-100 mt-2">
+                        <i class="fas fa-undo"></i> Undo
+                    </button>
+                </div>
+
+                <div class="info-panel">
+                    <p id="imageDim">No image loaded</p>
+                </div>
+            </aside>
+
+            <section class="canvas-area">
+                <div class="canvas-wrapper" id="canvasWrapper">
+                    <div id="dropZone" class="drop-zone">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <p>Drag & Drop an image here or click Upload</p>
+                    </div>
+                    <canvas id="bgCanvas"></canvas>
+                    <canvas id="maskCanvas"></canvas>
+                    <canvas id="tempCanvas"></canvas>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Notification system -->
+    <div id="toast" class="toast"></div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
