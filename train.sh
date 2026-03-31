@@ -23,7 +23,7 @@ export MALLOC_TRIM_THRESHOLD_=0
 export MALLOC_ARENA_MAX=1
 
 # ── WandB (đặt key ở đây thay vì trong YAML) ────────────────────────────────
-export WANDB_API_KEY="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"
+export WANDB_API_KEY=""
 
 # ── Pre-launch RAM check ──────────────────────────────────────────────────────
 RAM_PERCENT=$(free | awk 'NR==2{printf("%.0f", $3/$2 * 100.0)}')
