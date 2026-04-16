@@ -26,7 +26,7 @@ This repository provides an optimized pipeline for fine-tuning **Stable Diffusio
 
 1. **Clone the repository:**
    ```bash
-   git clone <repository_url>
+   git clone https://github.com/NhutTB/SDXL_Lora.git
    cd SDXL
    ```
 
