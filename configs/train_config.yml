@@ -81,7 +81,7 @@ loss_weights:
   # ★ INCREASED: 50 → 200. Aux loss cần VAE decode + VGG16 forward (rất nặng)
   # Với mixed resolutions từ data cũ, tần suất cao → OOM
   # Mỗi 200 steps = ~0.5% overhead → ổn định hơn
-  aux_loss_every_n_steps: 10
+  aux_loss_every_n_steps: 50
 # ── Training ──────────────────────────────────────────────────────────────────
 #
 #  ★ Throughput: effective_batch = 3 × 2 accum × 3 GPUs = 18
@@ -109,14 +109,14 @@ training:
   gradient_accumulation_steps: 4
   gradient_checkpointing: true
 
-  num_train_epochs: 50
+  num_train_epochs: 100
   max_train_steps: null
 
-  learning_rate: 5.0e-5
+  learning_rate: 1.0e-4
   text_encoder_lr: 1.0e-5
-  lr_scheduler: "cosine"
-  lr_warmup_steps: 100  # ★ Reduced from 200 → 100 (half warmup time)
-  lr_num_cycles: 1
+  lr_scheduler: "cosine_with_restarts"
+  lr_warmup_steps: 200  # ★ Reduced from 200 → 100 (half warmup time)
+  lr_num_cycles: 10
   lr_power: 1.0
 
   optimizer: "adamw"
@@ -135,8 +135,8 @@ training:
   snr_gamma: 5.0
   cfg_dropout_rate: 0.1
 
-  checkpointing_steps: 100
-  checkpoints_total_limit: 3
+  checkpointing_steps: 250
+  checkpoints_total_limit: 5
   resume_from_checkpoint: null
   
   # ★ NEW: Early stopping when validation LPIPS doesn't improve
@@ -160,7 +160,7 @@ validation:
   controlnet_conditioning_scale: 0.5
   
   # ★ No mask dilation (speed optimization)
-  mask_dilation_pct: 0.05  # ★ 0.05→0.0 (no dilation overhead)
+  mask_dilation_pct: 0.0  # ★ 0.05→0.0 (no dilation overhead)
   mask_max_area_pct: 0.70
 
 # ── Logging / WandB ───────────────────────────────────────────────────────────
@@ -181,3 +181,7 @@ logging:
   wandb_api_key: null
 
   log_every_n_steps: 10
+
+  # ★ Best loss tracking: vì SDXL add noise ngẫu nhiên nên loss dao động lớn.
+  # Mỗi N steps sẽ lấy giá trị loss nhỏ nhất trong window và log lên wandb.
+  best_loss_window_size: 50

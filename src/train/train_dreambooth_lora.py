@@ -431,7 +431,7 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Train / Val / Test split  (80 / 10 / 10)
+# Train / Val split  (95 / 5)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -451,14 +451,14 @@ def make_splits(
     masks_dir: str,
     depths_dir: str,
     captions_dir: str,
-    train_ratio: float = 0.8,
-    val_ratio: float   = 0.1,
+    train_ratio: float = 0.95,
+    val_ratio: float   = 0.05,
     seed: int          = 42,
 ) -> dict[str, list[Path]]:
     """
     Scan *images_dir* and keep images. Masks, depths, and captions are optional
     (Dataset class handles missing files with fallbacks).
-    Returns {"train": [...], "val": [...], "test": [...]}.
+    Returns {"train": [...], "val": [...]}.
     """
     images_root   = Path(images_dir)
     masks_root    = Path(masks_dir)
@@ -511,12 +511,11 @@ def make_splits(
     splits = {
         "train": shuffled[:n_train],
         "val":   shuffled[n_train: n_train + n_val],
-        "test":  shuffled[n_train + n_val:],
     }
 
     logger.info(
         f"Dataset split (seed={seed}): "
-        f"train={len(splits['train'])}  val={len(splits['val'])}  test={len(splits['test'])}  "
+        f"train={len(splits['train'])}  val={len(splits['val'])}  "
         f"total={n}"
     )
     return splits
@@ -2496,8 +2495,8 @@ def main(cfg):
         masks_dir=masks_dir,
         depths_dir=depths_dir,
         captions_dir=captions_dir,
-        train_ratio=getattr(cfg.data, "train_ratio", 0.8),
-        val_ratio=getattr(cfg.data,   "val_ratio",   0.1),
+        train_ratio=getattr(cfg.data, "train_ratio", 0.95),
+        val_ratio=getattr(cfg.data,   "val_ratio",   0.05),
         seed=cfg.training.seed,
     )
 
@@ -2525,13 +2524,12 @@ def main(cfg):
     )
 
     val_paths  = splits["val"]
-    test_paths = splits["test"]
     masks_root = Path(masks_dir)
     
     # ── Define validation prompt_map ──────────────────────────────────────
     val_prompt_map = {}
     if val_paths:
-        for p in val_paths + test_paths:
+        for p in val_paths:
             cap_path = train_dataset._find_file(Path(captions_dir), p.stem, [".txt"])
             if cap_path:
                 try:
@@ -2541,7 +2539,7 @@ def main(cfg):
 
     logger.info(
         f"  train={len(splits['train'])}  "
-        f"val={len(val_paths)}  test={len(test_paths)}"
+        f"val={len(val_paths)}"
     )
 
     # ★ FIX 2: Pre-compute VAE latents if enabled in config (eliminates VAE bottleneck)
@@ -2700,6 +2698,12 @@ def main(cfg):
 
     # ── Training loop ─────────────────────────────────────────────────────
     last_aux_log = {}  # ★ Cache aux_log between compute steps
+
+    # ★ Best loss tracking: collect losses in a window, log min every N steps
+    best_loss_window_size = getattr(cfg.logging, "best_loss_window_size", 50)
+    _loss_window: list[float] = []          # losses collected in current window
+    _best_loss_global: float = float("inf") # best loss seen across entire training
+
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         early_stop = False  # ★ Reset per-epoch (prevents NameError if no val step runs)
@@ -2989,6 +2993,25 @@ def main(cfg):
                     loss_val = loss.detach().item()
                     diff_val = diffusion_loss.detach().item()
                     lr_val   = lr_scheduler.get_last_lr()[0]
+
+                    # ★ Best loss tracking: collect every step
+                    _loss_window.append(loss_val)
+                    if len(_loss_window) >= best_loss_window_size:
+                        window_best = min(_loss_window)
+                        _best_loss_global = min(_best_loss_global, window_best)
+                        _loss_window.clear()
+
+                        best_log = {
+                            "train/loss_best_window": window_best,
+                            "train/loss_best_global": _best_loss_global,
+                        }
+                        accelerator.log(best_log, step=global_step)
+                        if use_wandb and wandb.run is not None:
+                            wandb.log(best_log, step=global_step)
+                        logger.info(
+                            f"[Step {global_step}] Best loss (window={best_loss_window_size}): "
+                            f"{window_best:.6f} | Global best: {_best_loss_global:.6f}"
+                        )
 
                     if global_step % cfg.logging.log_every_n_steps == 0:
                         log_dict = {
