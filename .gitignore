@@ -47,3 +47,7 @@ outputs/
 *.webp
 !comparison_preview_*.png
 !result_inpainting_*.png
+
+# Masks
+mask-making/
+
